@@ -1,11 +1,11 @@
 diff --git a/src/electron/main.ts b/src/electron/main.ts
-index 55cfe8d..ecf5880 100644
+index 6a50486..ee8bccf 100644
 --- a/src/electron/main.ts
 +++ b/src/electron/main.ts
-@@ -128,8 +128,9 @@ function setWindowTheme(theme: unknown): void {
+@@ -156,8 +156,9 @@ function setWindowTheme(theme: unknown): void {
    const window = mainWindow;
    if (!window || window.isDestroyed()) return;
-   window.setBackgroundColor(WINDOW_CHROME[theme].page);
+   window.setBackgroundColor(chrome.page);
 -  // The docked window has no frame at all, so no controls to tint.
 -  if (!dock.docked) window.setTitleBarOverlay(titleBarOverlay());
 +  // The docked window has no frame at all, so no controls to tint. macOS has no title bar
