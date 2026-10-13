@@ -1,0 +1,2268 @@
+diff --git a/src/electron/main.ts b/src/electron/main.ts
+index 6a504867ce79ac4157704a7a27fb21c382869d39..bc80ff78e275f613c425a6463b2ec2bcb4f20fcf 100644
+--- a/src/electron/main.ts
++++ b/src/electron/main.ts
+@@ -446,6 +446,10 @@ function registerIpcHandlers(): void {
+   ipcMain.handle('budget:deleteWallet', async (_event, id: string) => accountManager.getStore().deleteWallet(String(id)));
+   ipcMain.handle('budget:addWalletMovement', async (_event, movement) => accountManager.getStore().addWalletMovement(movement));
+   ipcMain.handle('budget:deleteWalletMovement', async (_event, id: string) => accountManager.getStore().deleteWalletMovement(String(id)));
++  ipcMain.handle('budget:addIncomeEntry', async (_event, income) => accountManager.getStore().addIncomeEntry(income));
++  ipcMain.handle('budget:toggleIncomeEntry', async (_event, id: string, active: boolean) => accountManager.getStore().toggleIncomeEntry(String(id), Boolean(active)));
++  ipcMain.handle('budget:deleteIncomeEntry', async (_event, id: string) => accountManager.getStore().deleteIncomeEntry(String(id)));
++  ipcMain.handle('budget:saveCategories', async (_event, categories: unknown) => accountManager.getStore().saveCategories(categories));
+   ipcMain.handle('budget:addLoan', async (_event, loan) => accountManager.getStore().addLoan(loan));
+   ipcMain.handle('budget:toggleLoan', async (_event, id: string, active: boolean) => accountManager.getStore().toggleLoan(id, active));
+   ipcMain.handle('budget:deleteLoan', async (_event, id: string) => accountManager.getStore().deleteLoan(id));
+diff --git a/src/electron/preload.ts b/src/electron/preload.ts
+index f2d5d4d371af707342cbc2a6b690e932f8de1d76..8010a170d3dc945d5c33a9dbe96dc64dd2dbb255 100644
+--- a/src/electron/preload.ts
++++ b/src/electron/preload.ts
+@@ -1,6 +1,6 @@
+ import { contextBridge, ipcRenderer } from 'electron';
+ import type { PackView } from '../shared/packs';
+-import type { BackupFile, Budget, Loan, NebulaState, PendingBackup, SyncStatus, UpdateStatus, Wallet, WalletMovement } from '../shared/types';
++import type { BackupFile, Budget, Category, Income, Loan, NebulaState, PendingBackup, SyncStatus, UpdateStatus, Wallet, WalletMovement } from '../shared/types';
+ 
+ function subscribe<T>(channel: string, callback: (payload: T) => void): () => void {
+   const listener = (_event: unknown, payload: T) => callback(payload);
+@@ -35,6 +35,10 @@ contextBridge.exposeInMainWorld('finterest', {
+   deleteWallet: (id: string) => ipcRenderer.invoke('budget:deleteWallet', id),
+   addWalletMovement: (movement: Partial<WalletMovement> & { walletId: string; amount: number; date: string }) => ipcRenderer.invoke('budget:addWalletMovement', movement),
+   deleteWalletMovement: (id: string) => ipcRenderer.invoke('budget:deleteWalletMovement', id),
++  addIncomeEntry: (income: Partial<Income> & { name: string; amount: number }) => ipcRenderer.invoke('budget:addIncomeEntry', income),
++  toggleIncomeEntry: (id: string, active: boolean) => ipcRenderer.invoke('budget:toggleIncomeEntry', id, active),
++  deleteIncomeEntry: (id: string) => ipcRenderer.invoke('budget:deleteIncomeEntry', id),
++  saveCategories: (categories: Array<Pick<Category, 'name' | 'kind'> & { id?: string }>) => ipcRenderer.invoke('budget:saveCategories', categories),
+   exportBackup: () => ipcRenderer.invoke('budget:exportBackup'),
+   importBackup: (backup: BackupFile) => ipcRenderer.invoke('budget:importBackup', backup),
+   saveBackupToFile: () => ipcRenderer.invoke('budget:saveBackupToFile'),
+diff --git a/src/electron/store.ts b/src/electron/store.ts
+index 70e43d3a2d3d840bdb8e68bee275be95ab05bf33..ad95bfac00e62d0f21cbaf639817e8606a5ec268 100644
+--- a/src/electron/store.ts
++++ b/src/electron/store.ts
+@@ -3,14 +3,17 @@ import fs from 'node:fs/promises';
+ import path from 'node:path';
+ import { app } from 'electron';
+ import initSqlJs, { Database as SqlJsDatabase } from 'sql.js';
+-import type { BackupFile, Budget, BudgetSnapshot, FixedExpense, Loan, VariableExpense, Wallet, WalletMovement } from '../shared/types';
++import type { BackupFile, Budget, BudgetSnapshot, Category, FixedExpense, Income, Loan, VariableExpense, Wallet, WalletMovement } from '../shared/types';
+ import { budgetInputError, sanitizeBudget, sanitizeWallet, sanitizeWalletMovement } from '../shared/budgets';
+ import {
+   createEmptySnapshot,
+   extractBackupSnapshot,
++  incomeInputError,
+   isValidDateString,
+   isValidMonthKey,
++  sanitizeCategories,
+   sanitizeFixedExpense,
++  sanitizeIncome,
+   sanitizeLoan,
+   sanitizeVariableExpense,
+ } from '../shared/budget';
+@@ -87,9 +90,58 @@ export class BudgetStore {
+       budgets: this.readBudgets(),
+       wallets: this.readWallets(),
+       walletMovements: this.readWalletMovements(),
++      incomes: this.readIncomes(),
++      // Only once the user edited the list: until then the renderer shows its built-in categories.
++      ...(this.readSingleText(database.exec("SELECT value FROM settings WHERE key = 'categoriesCustomized'"), 0) === '1' ? { categories: this.readCategories() } : {}),
+     };
+   }
+ 
++  /**
++   * Adds or edits an income besides the main monthly one: paid once on a date, or every month.
++   */
++  async addIncomeEntry(input: Partial<Income> & { name: string; amount: number }): Promise<BudgetSnapshot> {
++    const income = sanitizeIncome({ ...input, id: input.id ?? crypto.randomUUID() });
++    // Checked as given: "abc" must be refused, not stored as 0.
++    income.amount = Number(input.amount);
++    const error = incomeInputError(income);
++    if (error) throw new Error(error);
++    await this.runWithTransaction(() => {
++      this.requireDatabase().run(
++        'INSERT OR REPLACE INTO incomes (id, name, amount, category, frequency, dayOfMonth, date, active) VALUES (?, ?, ?, ?, ?, ?, ?, ?)',
++        [income.id, income.name, income.amount, income.category, income.frequency, income.dayOfMonth, income.date, income.active ? 1 : 0],
++      );
++    });
++    return this.getSnapshot();
++  }
++
++  async toggleIncomeEntry(id: string, active: boolean): Promise<BudgetSnapshot> {
++    await this.runWithTransaction(() => {
++      this.requireDatabase().run('UPDATE incomes SET active = ? WHERE id = ?', [active ? 1 : 0, id]);
++    });
++    return this.getSnapshot();
++  }
++
++  async deleteIncomeEntry(id: string): Promise<BudgetSnapshot> {
++    await this.runWithTransaction(() => {
++      this.requireDatabase().run('DELETE FROM incomes WHERE id = ?', [id]);
++    });
++    return this.getSnapshot();
++  }
++
++  /**
++   * Replaces the user's category list (create, delete, reorder: the list is short and saved whole).
++   * Items keep the category name they were saved with: deleting a category only stops offering it.
++   */
++  async saveCategories(input: unknown): Promise<BudgetSnapshot> {
++    const categories = sanitizeCategories(input, () => crypto.randomUUID());
++    if (!categories) throw new Error('ERR_INVALID_CATEGORY');
++    await this.runWithTransaction(() => {
++      const database = this.requireDatabase();
++      this.writeCategories(database, categories);
++    });
++    return this.getSnapshot();
++  }
++
+   async saveIncome(income: number): Promise<BudgetSnapshot> {
+     this.assertNonNegative(income);
+     await this.upsertSetting('income', String(income));
+@@ -356,6 +408,8 @@ export class BudgetStore {
+       database.run('DELETE FROM budgets');
+       database.run('DELETE FROM wallets');
+       database.run('DELETE FROM wallet_movements');
++      database.run('DELETE FROM incomes');
++      database.run('DELETE FROM categories');
+ 
+       database.run('INSERT INTO settings (key, value) VALUES (?, ?)', ['income', String(snapshot.settings.income)]);
+       database.run('INSERT INTO settings (key, value) VALUES (?, ?)', ['activeMonthKey', snapshot.settings.activeMonthKey]);
+@@ -393,6 +447,14 @@ export class BudgetStore {
+       for (const movement of snapshot.walletMovements ?? []) {
+         database.run('INSERT INTO wallet_movements (id, walletId, amount, label, date) VALUES (?, ?, ?, ?, ?)', [movement.id, movement.walletId, movement.amount, movement.label, movement.date]);
+       }
++      for (const income of snapshot.incomes ?? []) {
++        database.run(
++          'INSERT INTO incomes (id, name, amount, category, frequency, dayOfMonth, date, active) VALUES (?, ?, ?, ?, ?, ?, ?, ?)',
++          [income.id, income.name, income.amount, income.category, income.frequency, income.dayOfMonth, income.date, income.active ? 1 : 0],
++        );
++      }
++      // A backup without its own category list (older versions) goes back to the built-in one.
++      if (snapshot.categories) this.writeCategories(database, snapshot.categories);
+     });
+ 
+     return this.getSnapshot();
+@@ -475,6 +537,24 @@ export class BudgetStore {
+         label TEXT NOT NULL DEFAULT '',
+         date TEXT NOT NULL
+       );
++
++      CREATE TABLE IF NOT EXISTS incomes (
++        id TEXT PRIMARY KEY,
++        name TEXT NOT NULL,
++        amount REAL NOT NULL,
++        category TEXT NOT NULL DEFAULT '',
++        frequency TEXT NOT NULL DEFAULT 'once',
++        dayOfMonth INTEGER,
++        date TEXT,
++        active INTEGER NOT NULL DEFAULT 1
++      );
++
++      CREATE TABLE IF NOT EXISTS categories (
++        id TEXT PRIMARY KEY,
++        name TEXT NOT NULL,
++        kind TEXT NOT NULL DEFAULT 'expense',
++        position INTEGER NOT NULL DEFAULT 0
++      );
+     `);
+   }
+ 
+@@ -653,6 +733,36 @@ export class BudgetStore {
+     return (rows[0]?.values ?? []).map((row) => sanitizeWalletMovement({ id: String(row[0]), walletId: String(row[1]), amount: Number(row[2]), label: String(row[3]), date: String(row[4]) }));
+   }
+ 
++  private readIncomes(): Income[] {
++    const rows = this.requireDatabase().exec('SELECT id, name, amount, category, frequency, dayOfMonth, date, active FROM incomes ORDER BY rowid');
++    return (rows[0]?.values ?? []).map((row) =>
++      sanitizeIncome({
++        id: String(row[0]),
++        name: String(row[1]),
++        amount: Number(row[2]),
++        category: String(row[3]),
++        frequency: String(row[4]) as Income['frequency'],
++        dayOfMonth: row[5] === null ? null : Number(row[5]),
++        date: row[6] === null ? null : String(row[6]),
++        active: Boolean(row[7]),
++      }),
++    );
++  }
++
++  private readCategories(): Category[] {
++    const rows = this.requireDatabase().exec('SELECT id, name, kind FROM categories ORDER BY position, rowid');
++    return (rows[0]?.values ?? []).map((row) => ({ id: String(row[0]), name: String(row[1]), kind: row[2] === 'income' ? 'income' : 'expense' }));
++  }
++
++  /** Inside a transaction: replaces the category list and marks it as the user's own. */
++  private writeCategories(database: SqlJsDatabase, categories: Category[]): void {
++    database.run('DELETE FROM categories');
++    categories.forEach((category, position) => {
++      database.run('INSERT INTO categories (id, name, kind, position) VALUES (?, ?, ?, ?)', [category.id, category.name, category.kind, position]);
++    });
++    database.run('INSERT OR REPLACE INTO settings (key, value) VALUES (?, ?)', ['categoriesCustomized', '1']);
++  }
++
+   private readLoans(rows: ReturnType<SqlJsDatabase['exec']>): Loan[] {
+     const result: Loan[] = [];
+     const values = rows[0]?.values ?? [];
+diff --git a/src/renderer/App.tsx b/src/renderer/App.tsx
+index 1eae8843386197978dbb6845f5cd8e7e8123a028..f66d0788d91d468dee117143af1fd4512eb6950d 100644
+--- a/src/renderer/App.tsx
++++ b/src/renderer/App.tsx
+@@ -25,6 +25,9 @@ import { BudgetsPanel, type BudgetActions } from './components/BudgetsPanel';
+ import { WalletsPanel, type WalletActions } from './components/WalletsPanel';
+ import { LearnCard, type LearnState } from './components/LearnCard';
+ import { NewsPanel } from './components/NewsPanel';
++import { IncomesPanel, type IncomeActions } from './components/IncomesPanel';
++import { LedgerPanel } from './components/LedgerPanel';
++import { CategoriesPanel } from './components/CategoriesPanel';
+ import { useAppearancePacks, useAppliedPackTheme, usePackThemeChoice } from './packTheme';
+ import { findPackTheme } from '@shared/packs';
+ 
+@@ -41,7 +44,7 @@ const emptyLoanForm: LoanFormState = { name: '', principal: '', monthlyPayment:
+ const LEARN_POLL_MS = 30 * 1000;
+ 
+ /** Views that work on one month: they show the "Month" control in the page header. */
+-const MONTH_VIEWS: ActiveView[] = ['overview', 'calendar', 'fixed', 'variable', 'budgets', 'loans'];
++const MONTH_VIEWS: ActiveView[] = ['overview', 'ledger', 'calendar', 'incomes', 'fixed', 'variable', 'categories', 'budgets', 'loans'];
+ 
+ export function App() {
+   const [language, setLanguage] = useLanguage();
+@@ -470,6 +473,13 @@ export function App() {
+     deleteMovement: (id) => mutate(() => window.finterest.deleteWalletMovement(id), 'error.deleteItem', 'delete'),
+   };
+ 
++  // Incomes besides the main monthly one, and the user's own categories.
++  const incomeActions: IncomeActions = {
++    addIncome: (income) => mutate(() => window.finterest.addIncomeEntry(income), 'error.saveIncomeEntry', 'success'),
++    toggleIncome: (id, active) => mutate(() => window.finterest.toggleIncomeEntry(id, active), 'error.updateItem'),
++    deleteIncome: (id) => mutate(() => window.finterest.deleteIncomeEntry(id), 'error.deleteItem', 'delete'),
++  };
++
+   async function handleDeleteCalendarEntry(entry: CalendarEntry): Promise<void> {
+     await mutate(
+       () => (entry.source === 'fixed' ? window.finterest.deleteFixedExpense(entry.id) : window.finterest.deleteVariableExpense(entry.id)),
+@@ -620,6 +630,9 @@ export function App() {
+   const viewCopy: Record<ActiveView, { eyebrow: TranslationKey; title: TranslationKey }> = {
+     overview: { eyebrow: 'view.overview.eyebrow', title: 'view.overview.title' },
+     calendar: { eyebrow: 'view.calendar.eyebrow', title: 'view.calendar.title' },
++    ledger: { eyebrow: 'view.ledger.eyebrow', title: 'view.ledger.title' },
++    incomes: { eyebrow: 'view.incomes.eyebrow', title: 'view.incomes.title' },
++    categories: { eyebrow: 'view.categories.eyebrow', title: 'view.categories.title' },
+     fixed: { eyebrow: 'view.fixed.eyebrow', title: 'view.fixed.title' },
+     variable: { eyebrow: 'view.variable.eyebrow', title: 'view.variable.title' },
+     loans: { eyebrow: 'view.loans.eyebrow', title: 'view.loans.title' },
+@@ -738,6 +751,31 @@ export function App() {
+ 
+           {activeView === 'wallets' ? <WalletsPanel snapshot={snapshot} language={language} actions={walletActions} /> : null}
+ 
++          {activeView === 'ledger' ? <LedgerPanel snapshot={snapshot} monthKey={activeMonthKey} language={language} /> : null}
++
++          {activeView === 'incomes' ? (
++            <IncomesPanel
++              snapshot={snapshot}
++              summary={summary}
++              monthKey={activeMonthKey}
++              language={language}
++              incomeInput={incomeInput}
++              onIncomeInputChange={setIncomeInput}
++              onSaveIncome={() => void handleSaveIncome()}
++              actions={incomeActions}
++            />
++          ) : null}
++
++          {activeView === 'categories' ? (
++            <CategoriesPanel
++              snapshot={snapshot}
++              monthKey={activeMonthKey}
++              language={language}
++              onMonthChange={(monthKey) => void handleSaveMonthKey(monthKey)}
++              onSaveCategories={(categories) => mutate(() => window.finterest.saveCategories(categories), 'error.saveCategories', 'success')}
++            />
++          ) : null}
++
+           {activeView === 'calendar' ? (
+             <BudgetCalendar
+               monthKey={activeMonthKey}
+diff --git a/src/renderer/components/BudgetCalendar.tsx b/src/renderer/components/BudgetCalendar.tsx
+index 3b3c3de122279c0963a08b79fd01ab2600ca1798..d112eec6cf1e2c453b6bd918e4fedf295e0c0f2c 100644
+--- a/src/renderer/components/BudgetCalendar.tsx
++++ b/src/renderer/components/BudgetCalendar.tsx
+@@ -3,7 +3,7 @@ import type { BudgetSnapshot, CalendarEntry, FixedExpenseKind } from '@shared/ty
+ import { formatLocalDate, getCalendarEntries, parseAmount } from '@shared/budget';
+ import type { Language } from '../i18n';
+ import { translate } from '../i18n';
+-import { categoryIcon, formatMoney, subscriptionCategories } from '../constants';
++import { categoryIcon, categoryNames, formatMoney } from '../constants';
+ import { Icon } from './Icon';
+ import { BudgetSelect } from './BudgetSelect';
+ 
+@@ -54,6 +54,7 @@ export function BudgetCalendar({
+   const cells = Array.from({ length: Math.ceil((firstDay + daysInMonth) / 7) * 7 }, (_, index) => index - firstDay + 1);
+   const title = new Date(year, month - 1, 1).toLocaleDateString(locale, { month: 'long', year: 'numeric' });
+   const today = formatLocalDate(new Date());
++  const expenseCategories = categoryNames(snapshot, 'expense', language);
+   const entriesByDay = useMemo(() => getCalendarEntries(snapshot, monthKey), [snapshot, monthKey]);
+   const [form, setForm] = useState<CalendarFormState>(emptyForm('purchase'));
+   const [formError, setFormError] = useState<string | null>(null);
+@@ -263,15 +264,13 @@ export function BudgetCalendar({
+                   {form.mode === 'recurring' ? (
+                     <select required value={form.category} onChange={(event) => setForm({ ...form, category: event.target.value })}>
+                       <option value="">{t('calendar.choose')}</option>
+-                      {subscriptionCategories.map((category) => (
+-                        <option key={category.labelKey} value={translate(language, category.labelKey)}>{translate(language, category.labelKey)}</option>
+-                      ))}
++                      {expenseCategories.map((category) => <option key={category} value={category}>{category}</option>)}
+                     </select>
+                   ) : (
+                     <>
+                       <input list="calendar-purchase-categories" value={form.category} onChange={(event) => setForm({ ...form, category: event.target.value })} />
+                       <datalist id="calendar-purchase-categories">
+-                        {subscriptionCategories.map((category) => <option key={category.labelKey} value={translate(language, category.labelKey)} />)}
++                        {expenseCategories.map((category) => <option key={category} value={category} />)}
+                       </datalist>
+                     </>
+                   )}
+diff --git a/src/renderer/components/CategoriesPanel.tsx b/src/renderer/components/CategoriesPanel.tsx
+new file mode 100644
+index 0000000000000000000000000000000000000000..0b2c8b7c0747d1ed09a09334950c61f2758e6fef
+--- /dev/null
++++ b/src/renderer/components/CategoriesPanel.tsx
+@@ -0,0 +1,186 @@
++import { useMemo, useState, type CSSProperties } from 'react';
++import type { BudgetSnapshot, CategoryKind } from '@shared/types';
++import { categoryBreakdown, monthlyHistory, type CategoryTotal } from '@shared/cashflow';
++import { amountTone } from '@shared/budgets';
++import { MAX_CATEGORY_NAME } from '@shared/budget';
++import type { Language, TranslationKey } from '../i18n';
++import { translate } from '../i18n';
++import { categoryIcon, categoryLabel, effectiveCategories, formatMoney } from '../constants';
++import { Icon } from './Icon';
++
++export type CategoryList = Array<{ id?: string; name: string; kind: CategoryKind }>;
++
++/**
++ * "Catégories": the month's money in and out grouped by category, the last twelve months side by
++ * side, and the list of categories offered in the forms, which the user can extend and prune.
++ */
++export function CategoriesPanel({ snapshot, monthKey, language, onMonthChange, onSaveCategories }: {
++  snapshot: BudgetSnapshot;
++  monthKey: string;
++  language: Language;
++  onMonthChange: (monthKey: string) => void;
++  /** Saves the whole list; resolves to false when it was refused. */
++  onSaveCategories: (categories: CategoryList) => Promise<boolean>;
++}) {
++  const t = (key: TranslationKey, params?: Record<string, string>) => translate(language, key, params);
++  const locale = language === 'en' ? 'en-US' : 'fr-FR';
++  const breakdown = useMemo(() => categoryBreakdown(snapshot, monthKey), [snapshot, monthKey]);
++  const history = useMemo(() => monthlyHistory(snapshot, monthKey, 12), [snapshot, monthKey]);
++  const categories = effectiveCategories(snapshot, language);
++  const [name, setName] = useState('');
++  const [kind, setKind] = useState<CategoryKind>('expense');
++  const [formError, setFormError] = useState<string | null>(null);
++
++  const monthLabel = (key: string) => {
++    const [year, month] = key.split('-').map(Number);
++    const label = new Date(year, month - 1, 1).toLocaleDateString(locale, { month: 'long', year: 'numeric' });
++    return label.charAt(0).toUpperCase() + label.slice(1);
++  };
++
++  async function addCategory(): Promise<void> {
++    const trimmed = name.trim();
++    if (!trimmed || trimmed.length > MAX_CATEGORY_NAME) {
++      setFormError(t('error.invalidCategory'));
++      return;
++    }
++    if (categories.some((category) => category.kind === kind && category.name.toLocaleLowerCase() === trimmed.toLocaleLowerCase())) {
++      setFormError(t('error.duplicateCategory'));
++      return;
++    }
++    setFormError(null);
++    if (await onSaveCategories([...categories, { name: trimmed, kind }])) setName('');
++  }
++
++  const removeCategory = (target: { name: string; kind: CategoryKind }) =>
++    void onSaveCategories(categories.filter((category) => !(category.kind === target.kind && category.name === target.name)));
++
++  const breakdownCard = (titleKey: TranslationKey, emptyKey: TranslationKey, items: CategoryTotal[], total: number, direction: 'in' | 'out') => (
++    <article className="list-card category-card">
++      <div className="list-heading">
++        <div>
++          <h2>{t(titleKey)}</h2>
++          <p>{monthLabel(monthKey)}</p>
++        </div>
++        <strong className={`amount amount-${direction === 'in' ? 'positive' : 'negative'}`}>{direction === 'in' ? '+' : '−'}{formatMoney(total, language)}</strong>
++      </div>
++      {items.length === 0 ? <p className="ledger-hint">{t(emptyKey)}</p> : null}
++      <ul className="category-rows">
++        {items.map((item) => (
++          <li key={item.category.toLocaleLowerCase() || 'none'}>
++            <span className={`list-icon ledger-icon ${direction}`}><Icon name={categoryIcon(item.category, language)} size={18} /></span>
++            <div className="list-text">
++              <strong>{categoryLabel(item.category, language)}</strong>
++              <span>{item.count === 1 ? t('categories.count.one') : t('categories.count.many', { count: String(item.count) })} · {Math.round(item.share * 100)} %</span>
++              <div className={`budget-progress category-bar ${direction}`} aria-hidden="true"><i style={{ '--ratio': String(item.share) } as CSSProperties} /></div>
++            </div>
++            <span className="row-amount amount">{formatMoney(item.amount, language)}</span>
++          </li>
++        ))}
++      </ul>
++    </article>
++  );
++
++  const manageList = (listKind: CategoryKind, titleKey: TranslationKey) => {
++    const items = categories.filter((category) => category.kind === listKind);
++    return (
++      <div className="category-manage-list">
++        <h3>{t(titleKey)}</h3>
++        {items.length === 0 ? <p className="ledger-hint">{t('categories.manage.empty')}</p> : null}
++        <ul className="category-chips">
++          {items.map((category) => (
++            <li key={`${category.kind}-${category.name}`}>
++              <Icon name={categoryIcon(category.name, language)} size={14} />
++              <span>{category.name}</span>
++              <button
++                type="button"
++                className="ghost small icon-button danger"
++                data-sound="none"
++                onClick={() => removeCategory(category)}
++                aria-label={`${t('categories.manage.delete')} ${category.name}`}
++                title={t('categories.manage.delete')}
++              >
++                <Icon name="trash" size={14} />
++              </button>
++            </li>
++          ))}
++        </ul>
++      </div>
++    );
++  };
++
++  return (
++    <>
++      <section className="lists-grid">
++        {breakdownCard('categories.out.title', 'categories.empty.out', breakdown.out, breakdown.totalOut, 'out')}
++        {breakdownCard('categories.in.title', 'categories.empty.in', breakdown.in, breakdown.totalIn, 'in')}
++      </section>
++
++      <section className="list-card history-card">
++        <div className="list-heading">
++          <div>
++            <h2>{t('categories.history.title')}</h2>
++            <p>{t('categories.history.subtitle')}</p>
++          </div>
++        </div>
++        <div className="history-table" role="table">
++          <div className="history-row history-head" role="row">
++            <span role="columnheader">{t('categories.history.month')}</span>
++            <span role="columnheader">{t('ledger.totalIn')}</span>
++            <span role="columnheader">{t('ledger.totalOut')}</span>
++            <span role="columnheader">{t('ledger.balance')}</span>
++          </div>
++          {[...history].reverse().map((item) => (
++            <button
++              key={item.monthKey}
++              type="button"
++              role="row"
++              className={`history-row ${item.monthKey === monthKey ? 'active' : ''}`}
++              data-sound="nav"
++              aria-current={item.monthKey === monthKey ? 'true' : undefined}
++              onClick={() => onMonthChange(item.monthKey)}
++            >
++              <span role="cell">{monthLabel(item.monthKey)}</span>
++              <span role="cell" className="amount amount-positive">+{formatMoney(item.totalIn, language)}</span>
++              <span role="cell" className="amount amount-negative">−{formatMoney(item.totalOut, language)}</span>
++              <span role="cell" className={`amount amount-${amountTone(item.balance)}`}>{formatMoney(item.balance, language)}</span>
++            </button>
++          ))}
++        </div>
++      </section>
++
++      <section className="list-card category-manage">
++        <div className="list-heading">
++          <div>
++            <h2>{t('categories.manage.title')}</h2>
++            <p>{t('categories.manage.hint')}</p>
++          </div>
++        </div>
++        <form
++          className="category-form"
++          onSubmit={(event) => {
++            event.preventDefault();
++            void addCategory();
++          }}
++        >
++          <label>
++            {t('categories.manage.name')}
++            <input value={name} maxLength={MAX_CATEGORY_NAME} onChange={(event) => setName(event.target.value)} />
++          </label>
++          <label>
++            {t('categories.manage.kind')}
++            <select value={kind} onChange={(event) => setKind(event.target.value as CategoryKind)}>
++              <option value="expense">{t('categories.manage.kind.expense')}</option>
++              <option value="income">{t('categories.manage.kind.income')}</option>
++            </select>
++          </label>
++          <button type="submit" data-sound="none"><Icon name="plus" size={16} />{t('categories.manage.add')}</button>
++        </form>
++        {formError ? <p className="form-error" role="alert">{formError}</p> : null}
++        <div className="category-manage-grid">
++          {manageList('expense', 'categories.manage.expense')}
++          {manageList('income', 'categories.manage.income')}
++        </div>
++      </section>
++    </>
++  );
++}
+diff --git a/src/renderer/components/Dashboard.tsx b/src/renderer/components/Dashboard.tsx
+index 29df7b3658b2260e295692e56cb6136bc3e4cf27..089957e921a8975c260c69e988cf7e751f7bd0f1 100644
+--- a/src/renderer/components/Dashboard.tsx
++++ b/src/renderer/components/Dashboard.tsx
+@@ -2,7 +2,7 @@ import type { CSSProperties, ReactNode } from 'react';
+ import type { BudgetSnapshot, BudgetSummary, FixedExpenseKind, Loan } from '@shared/types';
+ import type { Language } from '../i18n';
+ import { translate } from '../i18n';
+-import { formatMoney, subscriptionCategories } from '../constants';
++import { categoryNames, formatMoney } from '../constants';
+ import { Card, FieldGroup, ListCard } from './atoms';
+ import { Icon } from './Icon';
+ import { BudgetSelect } from './BudgetSelect';
+@@ -78,6 +78,7 @@ export function Dashboard({
+   learn?: ReactNode;
+ }) {
+   const t = (key: Parameters<typeof translate>[1], params?: Record<string, string>) => translate(language, key, params);
++  const expenseCategories = categoryNames(snapshot, 'expense', language);
+ 
+   return (
+     <>
+@@ -152,9 +153,7 @@ export function Dashboard({
+                 {t('form.fixed.category')}
+                 <select value={fixedForm.category} onChange={(event) => onFixedFormChange({ ...fixedForm, category: event.target.value })}>
+                   <option value="">{t('form.fixed.categoryPlaceholder')}</option>
+-                  {subscriptionCategories.map((category) => (
+-                    <option key={category.labelKey} value={translate(language, category.labelKey)}>{translate(language, category.labelKey)}</option>
+-                  ))}
++                  {expenseCategories.map((category) => <option key={category} value={category}>{category}</option>)}
+                 </select>
+               </label>
+               <label>
+@@ -201,7 +200,7 @@ export function Dashboard({
+                 {t('form.variable.category')}
+                 <input list="variable-categories" value={variableForm.category} onChange={(event) => onVariableFormChange({ ...variableForm, category: event.target.value })} />
+                 <datalist id="variable-categories">
+-                  {subscriptionCategories.map((category) => <option key={category.labelKey} value={translate(language, category.labelKey)} />)}
++                  {expenseCategories.map((category) => <option key={category} value={category} />)}
+                 </datalist>
+               </label>
+               <label>
+diff --git a/src/renderer/components/IncomesPanel.tsx b/src/renderer/components/IncomesPanel.tsx
+new file mode 100644
+index 0000000000000000000000000000000000000000..9af70c90004c3e1f86e50adeada6750125820216
+--- /dev/null
++++ b/src/renderer/components/IncomesPanel.tsx
+@@ -0,0 +1,187 @@
++import { useState } from 'react';
++import type { BudgetSnapshot, BudgetSummary, Income, IncomeFrequency } from '@shared/types';
++import { formatLocalDate, parseAmount } from '@shared/budget';
++import type { Language } from '../i18n';
++import { translate } from '../i18n';
++import { categoryNames, formatMoney } from '../constants';
++import { Card, FieldGroup, ListCard } from './atoms';
++import { Icon } from './Icon';
++
++export interface IncomeActions {
++  addIncome: (income: Partial<Income> & { name: string; amount: number }) => Promise<boolean>;
++  toggleIncome: (id: string, active: boolean) => Promise<boolean>;
++  deleteIncome: (id: string) => Promise<boolean>;
++}
++
++interface IncomeFormState {
++  name: string;
++  amount: string;
++  category: string;
++  frequency: IncomeFrequency;
++  date: string;
++  dayOfMonth: string;
++}
++
++const emptyForm = (frequency: IncomeFrequency): IncomeFormState => ({ name: '', amount: '', category: '', frequency, date: formatLocalDate(new Date()), dayOfMonth: '' });
++
++function formatDate(date: string, language: Language): string {
++  const [year, month, day] = date.split('-').map(Number);
++  if (!year || !month || !day) return date;
++  return new Date(year, month - 1, day).toLocaleDateString(language === 'en' ? 'en-US' : 'fr-FR', { day: 'numeric', month: 'short' });
++}
++
++/**
++ * "Revenus": the main monthly income of the settings, plus any number of other incomes, each
++ * either one-off (a date) or recurring (every month, optionally on a given day).
++ */
++export function IncomesPanel({ snapshot, summary, monthKey, language, incomeInput, onIncomeInputChange, onSaveIncome, actions }: {
++  snapshot: BudgetSnapshot;
++  summary: BudgetSummary | null;
++  monthKey: string;
++  language: Language;
++  /** The main monthly income, typed as text (same field as on the overview). */
++  incomeInput: string;
++  onIncomeInputChange: (value: string) => void;
++  onSaveIncome: () => void;
++  actions: IncomeActions;
++}) {
++  const t = (key: Parameters<typeof translate>[1], params?: Record<string, string>) => translate(language, key, params);
++  const [form, setForm] = useState<IncomeFormState>(emptyForm('once'));
++  const [formError, setFormError] = useState<string | null>(null);
++  const incomes = snapshot.incomes ?? [];
++  const recurring = incomes.filter((income) => income.frequency === 'monthly');
++  const oneOff = incomes.filter((income) => income.frequency === 'once' && income.date?.slice(0, 7) === monthKey);
++  const categories = categoryNames(snapshot, 'income', language);
++
++  async function submit(): Promise<void> {
++    const amount = parseAmount(form.amount);
++    const day = form.dayOfMonth.trim() ? Number(form.dayOfMonth) : null;
++    if (!form.name.trim()) {
++      setFormError(t('error.invalidName'));
++      return;
++    }
++    if (!Number.isFinite(amount) || amount < 0) {
++      setFormError(t('error.negativeAmount'));
++      return;
++    }
++    if (form.frequency === 'monthly' && day !== null && (!Number.isInteger(day) || day < 1 || day > 31)) {
++      setFormError(t('error.invalidDate'));
++      return;
++    }
++    setFormError(null);
++    const saved = await actions.addIncome({
++      name: form.name,
++      amount,
++      category: form.category,
++      frequency: form.frequency,
++      date: form.frequency === 'once' ? form.date : null,
++      dayOfMonth: form.frequency === 'monthly' ? day : null,
++      active: true,
++    });
++    if (saved) setForm(emptyForm(form.frequency));
++  }
++
++  return (
++    <>
++      <section className="summary-grid">
++        <Card label={t('incomes.card.base')} value={formatMoney(summary?.baseIncome ?? 0, language)} accent="income" icon="bank" />
++        <Card label={t('incomes.card.recurring')} value={formatMoney(summary?.recurringIncome ?? 0, language)} accent="fixed" icon="repeat" />
++        <Card label={t('incomes.card.oneOff')} value={formatMoney(summary?.oneOffIncome ?? 0, language)} accent="variable" icon="sparkles" />
++        <Card label={t('incomes.card.total')} value={formatMoney(summary?.income ?? 0, language)} accent="remaining" icon="trendUp" tone="positive" />
++      </section>
++
++      <section className="input-panel income-forms">
++        <FieldGroup title={t('incomes.base.title')}>
++          <p className="field-note">{t('incomes.base.hint')}</p>
++          <label>
++            {t('form.income.label')}
++            <input aria-label={t('incomes.base.title')} value={incomeInput} onChange={(event) => onIncomeInputChange(event.target.value)} inputMode="decimal" />
++          </label>
++          <button className="ghost" data-sound="none" onClick={onSaveIncome}><Icon name="check" size={16} />{t('form.income.saveIncome')}</button>
++        </FieldGroup>
++
++        <article className="field-group income-form">
++          <h2>{t('incomes.form.title')}</h2>
++          <form
++            className="field-grid"
++            onSubmit={(event) => {
++              event.preventDefault();
++              void submit();
++            }}
++          >
++            <div className="segmented" role="radiogroup" aria-label={t('incomes.form.type')}>
++              <button type="button" role="radio" aria-checked={form.frequency === 'once'} className={form.frequency === 'once' ? 'active' : ''} onClick={() => setForm({ ...form, frequency: 'once' })}>
++                <Icon name="sparkles" size={15} />{t('incomes.type.once')}
++              </button>
++              <button type="button" role="radio" aria-checked={form.frequency === 'monthly'} className={form.frequency === 'monthly' ? 'active' : ''} onClick={() => setForm({ ...form, frequency: 'monthly' })}>
++                <Icon name="repeat" size={15} />{t('incomes.type.monthly')}
++              </button>
++            </div>
++            <p className="field-note">{t(form.frequency === 'once' ? 'incomes.note.once' : 'incomes.note.monthly')}</p>
++            <label>
++              {t('incomes.form.name')}
++              <input value={form.name} onChange={(event) => setForm({ ...form, name: event.target.value })} />
++            </label>
++            <label>
++              {t('incomes.form.amount')}
++              <input value={form.amount} onChange={(event) => setForm({ ...form, amount: event.target.value })} inputMode="decimal" placeholder="0,00" />
++            </label>
++            <label>
++              {t('incomes.form.category')}
++              <select value={form.category} onChange={(event) => setForm({ ...form, category: event.target.value })}>
++                <option value="">{t('incomes.form.categoryNone')}</option>
++                {categories.map((category) => <option key={category} value={category}>{category}</option>)}
++              </select>
++            </label>
++            {form.frequency === 'once' ? (
++              <label>
++                {t('incomes.form.date')}
++                <input type="date" value={form.date} onChange={(event) => setForm({ ...form, date: event.target.value })} />
++              </label>
++            ) : (
++              <label>
++                {t('incomes.form.day')}
++                <input value={form.dayOfMonth} onChange={(event) => setForm({ ...form, dayOfMonth: event.target.value })} inputMode="numeric" placeholder="1 – 31" />
++              </label>
++            )}
++            {formError ? <p className="form-error" role="alert">{formError}</p> : null}
++            <button type="submit" data-sound="none"><Icon name="plus" size={16} />{t('incomes.form.submit')}</button>
++          </form>
++        </article>
++      </section>
++
++      <section className="lists-grid">
++        <ListCard
++          title={t('incomes.list.recurring.title')}
++          subtitle={t('incomes.list.recurring.subtitle')}
++          language={language}
++          items={recurring.map((income) => ({
++            id: income.id,
++            name: income.name,
++            category: income.category,
++            amountLabel: `+${formatMoney(income.amount, language)}`,
++            active: income.active,
++            detail: income.dayOfMonth ? t('incomes.detail.day', { day: String(income.dayOfMonth) }) : t('incomes.detail.everyMonth'),
++          }))}
++          onToggle={(id, active) => void actions.toggleIncome(id, active)}
++          onDelete={(id) => void actions.deleteIncome(id)}
++          empty={{ icon: 'repeat', title: t('incomes.empty.recurring.title'), body: t('incomes.empty.recurring.body') }}
++        />
++        <ListCard
++          title={t('incomes.list.once.title')}
++          subtitle={t('incomes.list.once.subtitle', { month: monthKey })}
++          language={language}
++          items={oneOff.map((income) => ({
++            id: income.id,
++            name: income.name,
++            category: income.category,
++            amountLabel: `+${formatMoney(income.amount, language)}`,
++            detail: income.date ? formatDate(income.date, language) : undefined,
++          }))}
++          onDelete={(id) => void actions.deleteIncome(id)}
++          empty={{ icon: 'sparkles', title: t('incomes.empty.once.title'), body: t('incomes.empty.once.body') }}
++        />
++      </section>
++    </>
++  );
++}
+diff --git a/src/renderer/components/LedgerPanel.tsx b/src/renderer/components/LedgerPanel.tsx
+new file mode 100644
+index 0000000000000000000000000000000000000000..4bd78878f94510c8b03f15fdd602915f744aac85
+--- /dev/null
++++ b/src/renderer/components/LedgerPanel.tsx
+@@ -0,0 +1,124 @@
++import { useMemo, useState } from 'react';
++import type { BudgetSnapshot } from '@shared/types';
++import { getLedger, ledgerTotals, type LedgerEntry } from '@shared/cashflow';
++import { amountTone } from '@shared/budgets';
++import type { Language, TranslationKey } from '../i18n';
++import { translate } from '../i18n';
++import { categoryIcon, categoryLabel, formatMoney } from '../constants';
++import { Icon, type IconName } from './Icon';
++import { EmptyState } from './ScreenState';
++
++type Filter = 'all' | 'in' | 'out';
++
++const FILTERS: Array<{ id: Filter; labelKey: TranslationKey }> = [
++  { id: 'all', labelKey: 'ledger.filter.all' },
++  { id: 'in', labelKey: 'ledger.filter.in' },
++  { id: 'out', labelKey: 'ledger.filter.out' },
++];
++
++function entryIcon(entry: LedgerEntry, language: Language): IconName {
++  if (entry.source === 'baseIncome') return 'bank';
++  if (entry.source === 'loan') return 'bank';
++  const icon = categoryIcon(entry.category, language);
++  if (icon !== 'tag') return icon;
++  return entry.direction === 'in' ? 'trendUp' : entry.source === 'fixed' ? 'repeat' : 'bag';
++}
++
++function typeKey(entry: LedgerEntry, snapshot: BudgetSnapshot): TranslationKey {
++  switch (entry.source) {
++    case 'baseIncome':
++      return 'ledger.type.baseIncome';
++    case 'income':
++      return entry.recurring ? 'ledger.type.incomeMonthly' : 'ledger.type.incomeOnce';
++    case 'fixed':
++      return snapshot.fixedExpenses.find((expense) => expense.id === entry.id)?.kind === 'directDebit' ? 'badge.directDebit' : 'badge.subscription';
++    case 'loan':
++      return 'ledger.type.loan';
++    default:
++      return 'ledger.type.purchase';
++  }
++}
++
++/**
++ * "Entrées et sorties": every movement of the month, one after the other in date order, with the
++ * month's balance as it builds up. Read-only: each item is edited on its own screen.
++ */
++export function LedgerPanel({ snapshot, monthKey, language }: { snapshot: BudgetSnapshot; monthKey: string; language: Language }) {
++  const t = (key: TranslationKey, params?: Record<string, string>) => translate(language, key, params);
++  const locale = language === 'en' ? 'en-US' : 'fr-FR';
++  const [filter, setFilter] = useState<Filter>('all');
++  const entries = useMemo(() => getLedger(snapshot, monthKey), [snapshot, monthKey]);
++  const totals = useMemo(() => ledgerTotals(entries), [entries]);
++  const shown = filter === 'all' ? entries : entries.filter((entry) => entry.direction === filter);
++  const [year, month] = monthKey.split('-').map(Number);
++
++  // Consecutive entries of the same day share one heading.
++  const groups: Array<{ day: number | null; entries: LedgerEntry[] }> = [];
++  for (const entry of shown) {
++    const last = groups[groups.length - 1];
++    if (last && last.day === entry.day) last.entries.push(entry);
++    else groups.push({ day: entry.day, entries: [entry] });
++  }
++
++  const dayLabel = (day: number | null) => {
++    if (day === null) return t('ledger.undated');
++    const label = new Date(year, month - 1, day).toLocaleDateString(locale, { weekday: 'long', day: 'numeric', month: 'long' });
++    return label.charAt(0).toUpperCase() + label.slice(1);
++  };
++
++  return (
++    <section className="list-card ledger-panel">
++      <div className="ledger-toolbar">
++        <p className="ledger-hint">{t('ledger.hint')}</p>
++        <div className="segmented segmented-quiet" role="radiogroup" aria-label={t('ledger.filter.label')}>
++          {FILTERS.map((item) => (
++            <button key={item.id} type="button" role="radio" aria-checked={filter === item.id} className={filter === item.id ? 'active' : ''} data-sound="toggle" onClick={() => setFilter(item.id)}>
++              {t(item.labelKey)}
++            </button>
++          ))}
++        </div>
++      </div>
++
++      <div className="calendar-totals">
++        <span className="calendar-legend"><Icon name="trendUp" size={15} />{t('ledger.totalIn')} <b className="amount amount-positive">+{formatMoney(totals.totalIn, language)}</b></span>
++        <span className="calendar-legend"><Icon name="bag" size={15} />{t('ledger.totalOut')} <b className="amount amount-negative">−{formatMoney(totals.totalOut, language)}</b></span>
++        <span className="calendar-legend total">{t('ledger.balance')} <b className={`amount amount-${amountTone(totals.balance)}`}>{formatMoney(totals.balance, language)}</b></span>
++      </div>
++
++      {entries.length === 0 ? <EmptyState compact icon="history" title={t('ledger.empty.title')} body={t('ledger.empty.body')} /> : null}
++      {entries.length > 0 && shown.length === 0 ? <p className="ledger-hint">{t('ledger.empty.filtered')}</p> : null}
++
++      {groups.map((group) => (
++        <div key={group.day ?? 'undated'} className="ledger-day">
++          <h3>{dayLabel(group.day)}</h3>
++          <ul>
++            {group.entries.map((entry) => {
++              const name = entry.source === 'baseIncome' ? t('ledger.baseIncome') : entry.name;
++              const meta = [
++                t(typeKey(entry, snapshot)),
++                entry.source === 'baseIncome' || entry.source === 'loan' ? null : categoryLabel(entry.category, language),
++                entry.budgetName ?? null,
++                entry.forecast ? t('budgets.forecast') : null,
++              ].filter(Boolean).join(' · ');
++              return (
++                <li key={entry.key} className={entry.forecast ? 'inactive' : undefined}>
++                  <span className={`list-icon ledger-icon ${entry.direction}`}><Icon name={entryIcon(entry, language)} size={18} /></span>
++                  <div className="list-text">
++                    <strong>{name}</strong>
++                    <span>{meta}</span>
++                  </div>
++                  <div className="row-actions ledger-amounts">
++                    <span className={`row-amount amount amount-${entry.direction === 'in' ? 'positive' : 'negative'}`}>
++                      {entry.direction === 'in' ? '+' : '−'}{formatMoney(entry.amount, language)}
++                    </span>
++                    {filter === 'all' && !entry.forecast ? <small className="ledger-balance">{t('ledger.runningBalance', { amount: formatMoney(entry.balance, language) })}</small> : null}
++                  </div>
++                </li>
++              );
++            })}
++          </ul>
++        </div>
++      ))}
++    </section>
++  );
++}
+diff --git a/src/renderer/components/Sidebar.tsx b/src/renderer/components/Sidebar.tsx
+index a2812e0206881f57827f70cb65e1c03e99cc565d..78bc78bced27ecec11618ba6f62644e4bdccccf9 100644
+--- a/src/renderer/components/Sidebar.tsx
++++ b/src/renderer/components/Sidebar.tsx
+@@ -7,14 +7,17 @@ import { Avatar } from './atoms';
+ import { Icon, type IconName } from './Icon';
+ import logoUrl from '../../../assets/nebula-logo.svg';
+ 
+-export type ActiveView = 'overview' | 'calendar' | 'fixed' | 'variable' | 'budgets' | 'projects' | 'wallets' | 'loans' | 'calculator' | 'news' | 'profile' | 'settings';
++export type ActiveView = 'overview' | 'ledger' | 'calendar' | 'incomes' | 'fixed' | 'variable' | 'categories' | 'budgets' | 'projects' | 'wallets' | 'loans' | 'calculator' | 'news' | 'profile' | 'settings';
+ type NavGroup = 'budget' | 'plans' | 'tools' | 'system';
+ 
+ export const NAV_ITEMS: Array<{ view: ActiveView; group: NavGroup; labelKey: TranslationKey; icon: IconName }> = [
+   { view: 'overview', group: 'budget', labelKey: 'nav.overview', icon: 'navHome' },
++  { view: 'ledger', group: 'budget', labelKey: 'nav.ledger', icon: 'history' },
+   { view: 'calendar', group: 'budget', labelKey: 'nav.calendar', icon: 'calendar' },
++  { view: 'incomes', group: 'budget', labelKey: 'nav.incomes', icon: 'trendUp' },
+   { view: 'fixed', group: 'budget', labelKey: 'nav.fixed', icon: 'repeat' },
+   { view: 'variable', group: 'budget', labelKey: 'nav.variable', icon: 'bag' },
++  { view: 'categories', group: 'budget', labelKey: 'nav.categories', icon: 'tag' },
+   { view: 'budgets', group: 'budget', labelKey: 'nav.budgets', icon: 'layers' },
+   { view: 'projects', group: 'plans', labelKey: 'nav.projects', icon: 'rocket' },
+   { view: 'wallets', group: 'plans', labelKey: 'nav.wallets', icon: 'wallet' },
+@@ -116,12 +119,15 @@ export function Sidebar({ active, account, nebulaState, syncError, version, lang
+       ) : null}
+ 
+       <nav className="sidebar-nav" aria-label={t('nav.sections')}>
+-        {(Object.keys(GROUP_TITLES) as Array<keyof typeof GROUP_TITLES>).map((group) => (
+-          <div key={group} className="nav-group" role="group" aria-labelledby={`nav-group-${group}`}>
+-            <p className="nav-group-title" id={`nav-group-${group}`}>{t(GROUP_TITLES[group])}</p>
+-            {NAV_ITEMS.filter((item) => item.group === group && (item.view !== 'news' || connected)).map(navItem)}
+-          </div>
+-        ))}
++        {/* The sections scroll on their own when the window is short: Settings, the Hub card and the footer stay in place. */}
++        <div className="sidebar-nav-scroll">
++          {(Object.keys(GROUP_TITLES) as Array<keyof typeof GROUP_TITLES>).map((group) => (
++            <div key={group} className="nav-group" role="group" aria-labelledby={`nav-group-${group}`}>
++              <p className="nav-group-title" id={`nav-group-${group}`}>{t(GROUP_TITLES[group])}</p>
++              {NAV_ITEMS.filter((item) => item.group === group && (item.view !== 'news' || connected)).map(navItem)}
++            </div>
++          ))}
++        </div>
+         <div className="nav-group nav-group-system">
+           {NAV_ITEMS.filter((item) => item.group === 'system').map(navItem)}
+         </div>
+diff --git a/src/renderer/constants.ts b/src/renderer/constants.ts
+index fa7d5b784a7b175b5a2e0305f4ad750e37f392d5..fbe3c6c1363a07b39984721d1439095b8d1ada55 100644
+--- a/src/renderer/constants.ts
++++ b/src/renderer/constants.ts
+@@ -1,6 +1,8 @@
+ import type { Language, TranslationKey } from './i18n';
+ import { translate } from './i18n';
+ import type { IconName } from './components/Icon';
++import type { BudgetSnapshot, CategoryKind } from '@shared/types';
++import { BASE_INCOME_CATEGORY, LOAN_CATEGORY } from '@shared/cashflow';
+ 
+ export interface SubscriptionCategory {
+   labelKey: TranslationKey;
+@@ -14,9 +16,41 @@ export const subscriptionCategories: SubscriptionCategory[] = [
+   { labelKey: 'category.transport', icon: 'car' },
+   { labelKey: 'category.insurance', icon: 'shield' },
+   { labelKey: 'category.wellbeing', icon: 'heart' },
++  { labelKey: 'category.food', icon: 'bag' },
++  { labelKey: 'category.leisure', icon: 'sparkles' },
++  { labelKey: 'category.health', icon: 'heart' },
+   { labelKey: 'category.other', icon: 'tag' },
+ ];
+ 
++/** Built-in categories of incomes, offered until the user edits the list. */
++export const incomeCategories: SubscriptionCategory[] = [
++  { labelKey: 'category.income.salary', icon: 'bank' },
++  { labelKey: 'category.income.bonus', icon: 'sparkles' },
++  { labelKey: 'category.income.benefits', icon: 'shield' },
++  { labelKey: 'category.income.refund', icon: 'refresh' },
++  { labelKey: 'category.income.sale', icon: 'store' },
++  { labelKey: 'category.other', icon: 'tag' },
++];
++
++const builtIn = (kind: CategoryKind) => (kind === 'income' ? incomeCategories : subscriptionCategories);
++
++/**
++ * The categories offered in the forms: the user's own list once it was edited (Categories screen),
++ * else the built-in one in the interface language.
++ */
++export function categoryNames(snapshot: Pick<BudgetSnapshot, 'categories'> | null, kind: CategoryKind, language: Language): string[] {
++  if (snapshot?.categories) {
++    return snapshot.categories.filter((category) => category.kind === kind).map((category) => category.name);
++  }
++  return builtIn(kind).map((category) => translate(language, category.labelKey));
++}
++
++/** The full list as it is saved the first time the user edits it. */
++export function effectiveCategories(snapshot: Pick<BudgetSnapshot, 'categories'> | null, language: Language): Array<{ id?: string; name: string; kind: CategoryKind }> {
++  if (snapshot?.categories) return snapshot.categories.map(({ id, name, kind }) => ({ id, name, kind }));
++  return (['expense', 'income'] as const).flatMap((kind) => categoryNames(null, kind, language).map((name) => ({ name, kind })));
++}
++
+ /** English labels written by the starter data (store.ts `ensureSeedData`) and by early versions. */
+ const LEGACY_CATEGORY_ICONS: Record<string, IconName> = {
+   housing: 'home',
+@@ -32,8 +66,15 @@ export function formatMoney(value: number, language: Language): string {
+ 
+ /** Categories are stored as the display label the user picked, so they are matched against both languages; anything else gets the generic tag. */
+ export function categoryIcon(category: string, language: Language): IconName {
+-  const match = subscriptionCategories.find(
++  const match = [...subscriptionCategories, ...incomeCategories].find(
+     (item) => translate(language, item.labelKey) === category || translate('fr', item.labelKey) === category || translate('en', item.labelKey) === category,
+   );
+   return match?.icon ?? LEGACY_CATEGORY_ICONS[category.trim().toLowerCase()] ?? 'tag';
+ }
++
++/** The words shown for a category stored on a movement: the two special keys, or "no category". */
++export function categoryLabel(category: string, language: Language): string {
++  if (category === BASE_INCOME_CATEGORY) return translate(language, 'categories.baseIncome');
++  if (category === LOAN_CATEGORY) return translate(language, 'categories.loans');
++  return category || translate(language, 'categories.uncategorized');
++}
+diff --git a/src/renderer/i18n.ts b/src/renderer/i18n.ts
+index a366a74525c258a4f94b03997ae201770d375305..382327ba46fab2dc52e4840c583320597a27a8cb 100644
+--- a/src/renderer/i18n.ts
++++ b/src/renderer/i18n.ts
+@@ -253,6 +253,99 @@ export type TranslationKey =
+   | 'sync.warning'
+   | 'sync.guestNote'
+   | 'sync.restorable' | 'sync.restore' | 'sync.restoreNote' | 'sync.restored' | 'backup.rootNote' | 'saveKey.title' | 'saveKey.hint' | 'saveKey.show' | 'saveKey.hide' | 'saveKey.warning' | 'saveKey.import' | 'saveKey.add' | 'saveKey.added' | 'saveKey.invalid' | 'saveKey.error' | 'error.backupKeyUnknown' | 'import.pending.title' | 'import.latest.title' | 'import.pending.body' | 'import.latest.body' | 'import.pending.source' | 'import.pending.confirm' | 'import.pending.dismiss' | 'import.pending.locked' | 'import.done' | 'nebula.title' | 'nebula.connected' | 'nebula.offline' | 'nebula.follow' | 'nebula.followHint' | 'nebula.updatesByHub' | 'nebula.updatesByHubHint' | 'nebula.privacy' | 'nebula.apps' | 'nebula.notInstalled' | 'dock.bar' | 'dock.detach'
++  | 'nav.incomes'
++  | 'nav.ledger'
++  | 'nav.categories'
++  | 'view.incomes.eyebrow'
++  | 'view.incomes.title'
++  | 'view.ledger.eyebrow'
++  | 'view.ledger.title'
++  | 'view.categories.eyebrow'
++  | 'view.categories.title'
++  | 'incomes.card.base'
++  | 'incomes.card.recurring'
++  | 'incomes.card.oneOff'
++  | 'incomes.card.total'
++  | 'incomes.base.title'
++  | 'incomes.base.hint'
++  | 'incomes.form.title'
++  | 'incomes.form.name'
++  | 'incomes.form.amount'
++  | 'incomes.form.category'
++  | 'incomes.form.categoryNone'
++  | 'incomes.form.type'
++  | 'incomes.type.once'
++  | 'incomes.type.monthly'
++  | 'incomes.form.date'
++  | 'incomes.form.day'
++  | 'incomes.form.submit'
++  | 'incomes.note.once'
++  | 'incomes.note.monthly'
++  | 'incomes.list.recurring.title'
++  | 'incomes.list.recurring.subtitle'
++  | 'incomes.list.once.title'
++  | 'incomes.list.once.subtitle'
++  | 'incomes.empty.recurring.title'
++  | 'incomes.empty.recurring.body'
++  | 'incomes.empty.once.title'
++  | 'incomes.empty.once.body'
++  | 'incomes.detail.day'
++  | 'incomes.detail.everyMonth'
++  | 'error.saveIncomeEntry'
++  | 'error.saveCategories'
++  | 'error.invalidCategory'
++  | 'error.duplicateCategory'
++  | 'category.income.salary'
++  | 'category.income.bonus'
++  | 'category.income.benefits'
++  | 'category.income.refund'
++  | 'category.income.sale'
++  | 'category.food'
++  | 'category.leisure'
++  | 'category.health'
++  | 'ledger.hint'
++  | 'ledger.filter.label'
++  | 'ledger.filter.all'
++  | 'ledger.filter.in'
++  | 'ledger.filter.out'
++  | 'ledger.totalIn'
++  | 'ledger.totalOut'
++  | 'ledger.balance'
++  | 'ledger.undated'
++  | 'ledger.baseIncome'
++  | 'ledger.type.baseIncome'
++  | 'ledger.type.incomeOnce'
++  | 'ledger.type.incomeMonthly'
++  | 'ledger.type.purchase'
++  | 'ledger.type.loan'
++  | 'ledger.runningBalance'
++  | 'ledger.empty.title'
++  | 'ledger.empty.body'
++  | 'ledger.empty.filtered'
++  | 'categories.hint'
++  | 'categories.in.title'
++  | 'categories.out.title'
++  | 'categories.count.one'
++  | 'categories.count.many'
++  | 'categories.empty.in'
++  | 'categories.empty.out'
++  | 'categories.uncategorized'
++  | 'categories.baseIncome'
++  | 'categories.loans'
++  | 'categories.history.title'
++  | 'categories.history.subtitle'
++  | 'categories.history.month'
++  | 'categories.manage.title'
++  | 'categories.manage.hint'
++  | 'categories.manage.expense'
++  | 'categories.manage.income'
++  | 'categories.manage.name'
++  | 'categories.manage.kind'
++  | 'categories.manage.kind.expense'
++  | 'categories.manage.kind.income'
++  | 'categories.manage.add'
++  | 'categories.manage.delete'
++  | 'categories.manage.empty'
+   | 'error.invalidName'
+   | 'error.invalidDate'
+   | 'error.invalidMonth'
+@@ -311,9 +404,9 @@ export const fr: Record<TranslationKey, string> = {
+   'budgets.expenseAdd': 'Ajouter la dépense',
+   'budgets.recent': 'Dernières dépenses',
+   'budgets.noExpense': 'Aucune dépense pour le moment.',
+-  'budgets.more': 'Et {count} de plus dans vos achats prévus.',
++  'budgets.more': 'Et {count} de plus dans vos achats.',
+   'budgets.deleteTitle': 'Supprimer « {name} » ?',
+-  'budgets.deleteKeep': 'Ses sous-enveloppes sont supprimées aussi. Ses dépenses restent dans vos achats prévus, sans budget.',
++  'budgets.deleteKeep': 'Ses sous-enveloppes sont supprimées aussi. Ses dépenses restent dans vos achats, sans budget.',
+   'budgets.deleteForecast': 'Ses sous-enveloppes et ses dépenses prévisionnelles sont supprimées aussi.',
+   'budgets.empty.title': 'Aucun budget pour l’instant',
+   'budgets.empty.body': 'Créez un budget (courses, loisirs…), puis ajoutez-y vos dépenses : il se met à jour tout seul.',
+@@ -382,7 +475,7 @@ export const fr: Record<TranslationKey, string> = {
+   'settings.historicThemes': 'Thèmes historiques',
+   'empty.fixed.title': 'Aucun abonnement pour l’instant',
+   'empty.fixed.body': 'Ajoutez votre premier abonnement ou prélèvement avec le formulaire.',
+-  'empty.variable.title': 'Aucun achat prévu ce mois-ci',
++  'empty.variable.title': 'Aucun achat ce mois-ci',
+   'empty.variable.body': 'Ajoutez un achat avec le formulaire, ou depuis un jour du calendrier.',
+   'empty.loans.title': 'Aucun prêt en cours',
+   'empty.loans.body': 'Ajoutez un prêt pour compter ses mensualités dans votre reste à vivre.',
+@@ -391,18 +484,18 @@ export const fr: Record<TranslationKey, string> = {
+   'nav.overview': "Vue d'ensemble",
+   'nav.calendar': 'Calendrier',
+   'nav.fixed': 'Abonnements',
+-  'nav.variable': 'Achats prévus',
++  'nav.variable': 'Achats',
+   'nav.loans': 'Prêts',
+   'nav.settings': 'Réglages',
+   'nav.profile': 'Profil',
+   'view.overview.eyebrow': 'Votre budget',
+   'view.overview.title': 'Mon budget du mois',
+-  'view.calendar.eyebrow': 'Échéances et achats prévus',
++  'view.calendar.eyebrow': 'Échéances et achats',
+   'view.calendar.title': 'Calendrier',
+   'view.fixed.eyebrow': 'Charges récurrentes',
+   'view.fixed.title': 'Mes abonnements et prélèvements',
+-  'view.variable.eyebrow': 'Achats prévus',
+-  'view.variable.title': 'Mes achats prévus',
++  'view.variable.eyebrow': 'Achats',
++  'view.variable.title': 'Mes achats',
+   'view.loans.eyebrow': 'Crédits en cours',
+   'view.loans.title': 'Mes prêts bancaires',
+   'view.settings.eyebrow': 'Apparence, sons et données',
+@@ -414,7 +507,7 @@ export const fr: Record<TranslationKey, string> = {
+   'month.label': 'Mois concerné',
+   'card.income': 'Revenus du mois',
+   'card.fixed': 'Abonnements / Prélèvements',
+-  'card.variable': 'Achats prévus',
++  'card.variable': 'Achats',
+   'card.loans': 'Prêts',
+   'card.remaining': 'Reste à vivre',
+   'insight.status': 'État du budget',
+@@ -440,11 +533,11 @@ export const fr: Record<TranslationKey, string> = {
+   'form.fixed.type.subscription': 'Abonnement',
+   'form.fixed.type.directDebit': 'Prélèvement',
+   'form.fixed.submit': 'Ajouter',
+-  'form.variable.title': 'Prévoir un achat',
++  'form.variable.title': 'Ajouter un achat',
+   'form.variable.name': "Nom de l'achat",
+-  'form.variable.amount': 'Prix prévu',
++  'form.variable.amount': 'Prix',
+   'form.variable.category': 'Catégorie',
+-  'form.variable.date': 'Date prévue',
++  'form.variable.date': 'Date',
+   'form.variable.submit': "Ajouter l'achat",
+   'form.loan.title': 'Nouveau prêt',
+   'form.loan.name': 'Nom du prêt',
+@@ -456,8 +549,8 @@ export const fr: Record<TranslationKey, string> = {
+   'list.fixed.title': 'Mes abonnements et prélèvements',
+   'list.fixed.subtitle': 'Ce qui tombe chaque mois. Désactivez sans supprimer.',
+   'list.fixed.day': 'le {day} du mois',
+-  'list.variable.title': 'Mes achats prévus',
+-  'list.variable.subtitle': 'Achats prévus pour {month}.',
++  'list.variable.title': 'Mes achats',
++  'list.variable.subtitle': 'Achats de {month}.',
+   'list.loans.title': 'Mes prêts',
+   'list.loans.subtitle': 'Vos crédits en cours et leurs mensualités.',
+   'list.activate': 'Activer',
+@@ -540,7 +633,7 @@ export const fr: Record<TranslationKey, string> = {
+   'advanced.contributedOf': 'Dont {amount} versés',
+   'advanced.interestOf': 'Dont {amount} d’intérêts',
+   'calendar.monthlyView': 'Vue mensuelle',
+-  'calendar.hint': 'Vos abonnements, prélèvements et achats prévus, jour par jour.',
++  'calendar.hint': 'Vos abonnements, prélèvements et achats, jour par jour.',
+   'calendar.prevMonth': 'Mois précédent',
+   'calendar.nextMonth': 'Mois suivant',
+   'calendar.newSubscription': 'Nouvel abonnement / prélèvement',
+@@ -681,6 +774,99 @@ export const fr: Record<TranslationKey, string> = {
+   'nebula.notInstalled': 'Nebula Hub n’est pas installé : sa page de téléchargement vient de s’ouvrir.',
+   'dock.bar': 'Affichée dans Nebula Hub',
+   'dock.detach': 'Détacher',
++  'nav.incomes': 'Revenus',
++  'nav.ledger': 'Entrées et sorties',
++  'nav.categories': 'Catégories',
++  'view.incomes.eyebrow': 'Argent qui rentre',
++  'view.incomes.title': 'Mes revenus',
++  'view.ledger.eyebrow': 'Jour après jour',
++  'view.ledger.title': 'Entrées et sorties',
++  'view.categories.eyebrow': 'Par catégorie et par mois',
++  'view.categories.title': 'Catégories',
++  'incomes.card.base': 'Revenu principal',
++  'incomes.card.recurring': 'Revenus récurrents',
++  'incomes.card.oneOff': 'Revenus ponctuels',
++  'incomes.card.total': 'Total du mois',
++  'incomes.base.title': 'Revenu mensuel principal',
++  'incomes.base.hint': 'Votre revenu de tous les mois (salaire, pension). Les autres revenus s’ajoutent en dessous.',
++  'incomes.form.title': 'Ajouter un revenu',
++  'incomes.form.name': 'Nom du revenu',
++  'incomes.form.amount': 'Montant',
++  'incomes.form.category': 'Catégorie',
++  'incomes.form.categoryNone': 'Sans catégorie',
++  'incomes.form.type': 'Type de revenu',
++  'incomes.type.once': 'Ponctuel',
++  'incomes.type.monthly': 'Récurrent',
++  'incomes.form.date': 'Date',
++  'incomes.form.day': 'Jour du mois (facultatif)',
++  'incomes.form.submit': 'Ajouter le revenu',
++  'incomes.note.once': 'Reçu une seule fois, à la date choisie : une prime, un remboursement, une vente.',
++  'incomes.note.monthly': 'Reçu tous les mois : un second salaire, une aide, un loyer perçu.',
++  'incomes.list.recurring.title': 'Revenus récurrents',
++  'incomes.list.recurring.subtitle': 'Comptés tous les mois tant qu’ils sont actifs.',
++  'incomes.list.once.title': 'Revenus ponctuels',
++  'incomes.list.once.subtitle': 'Reçus en {month}.',
++  'incomes.empty.recurring.title': 'Aucun revenu récurrent',
++  'incomes.empty.recurring.body': 'Ajoutez ici ce qui rentre tous les mois en plus de votre revenu principal.',
++  'incomes.empty.once.title': 'Aucun revenu ponctuel ce mois-ci',
++  'incomes.empty.once.body': 'Une prime, un remboursement ou une vente : ajoutez-les avec leur date.',
++  'incomes.detail.day': 'Le {day} du mois',
++  'incomes.detail.everyMonth': 'Tous les mois',
++  'error.saveIncomeEntry': 'Impossible d’enregistrer le revenu.',
++  'error.saveCategories': 'Impossible d’enregistrer les catégories.',
++  'error.invalidCategory': 'Cette catégorie n’est pas valide.',
++  'error.duplicateCategory': 'Cette catégorie existe déjà.',
++  'category.income.salary': 'Salaire',
++  'category.income.bonus': 'Prime',
++  'category.income.benefits': 'Aides et allocations',
++  'category.income.refund': 'Remboursement',
++  'category.income.sale': 'Vente',
++  'category.food': 'Courses',
++  'category.leisure': 'Loisirs',
++  'category.health': 'Santé',
++  'ledger.hint': 'Tout ce qui rentre et tout ce qui sort ce mois-ci, dans l’ordre des dates.',
++  'ledger.filter.label': 'Afficher',
++  'ledger.filter.all': 'Tout',
++  'ledger.filter.in': 'Entrées',
++  'ledger.filter.out': 'Sorties',
++  'ledger.totalIn': 'Entrées',
++  'ledger.totalOut': 'Sorties',
++  'ledger.balance': 'Solde du mois',
++  'ledger.undated': 'Dans le mois, sans jour précis',
++  'ledger.baseIncome': 'Revenu mensuel principal',
++  'ledger.type.baseIncome': 'Revenu principal',
++  'ledger.type.incomeOnce': 'Revenu ponctuel',
++  'ledger.type.incomeMonthly': 'Revenu récurrent',
++  'ledger.type.purchase': 'Achat',
++  'ledger.type.loan': 'Mensualité de prêt',
++  'ledger.runningBalance': 'Solde : {amount}',
++  'ledger.empty.title': 'Aucun mouvement ce mois-ci',
++  'ledger.empty.body': 'Ajoutez un revenu, une charge ou un achat : ils apparaîtront ici, jour après jour.',
++  'ledger.empty.filtered': 'Rien à afficher avec ce filtre.',
++  'categories.hint': 'Vos entrées et vos sorties du mois, regroupées par catégorie.',
++  'categories.in.title': 'Entrées par catégorie',
++  'categories.out.title': 'Sorties par catégorie',
++  'categories.count.one': '1 opération',
++  'categories.count.many': '{count} opérations',
++  'categories.empty.in': 'Aucune entrée ce mois-ci.',
++  'categories.empty.out': 'Aucune sortie ce mois-ci.',
++  'categories.uncategorized': 'Sans catégorie',
++  'categories.baseIncome': 'Revenu principal',
++  'categories.loans': 'Prêts',
++  'categories.history.title': 'Mois par mois',
++  'categories.history.subtitle': 'Les douze derniers mois. Cliquez sur un mois pour voir ses catégories.',
++  'categories.history.month': 'Mois',
++  'categories.manage.title': 'Gérer les catégories',
++  'categories.manage.hint': 'Créez vos propres catégories ou supprimez celles dont vous ne vous servez pas. Les éléments déjà enregistrés gardent leur catégorie.',
++  'categories.manage.expense': 'Catégories de dépenses',
++  'categories.manage.income': 'Catégories de revenus',
++  'categories.manage.name': 'Nouvelle catégorie',
++  'categories.manage.kind': 'Pour',
++  'categories.manage.kind.expense': 'Les dépenses',
++  'categories.manage.kind.income': 'Les revenus',
++  'categories.manage.add': 'Créer la catégorie',
++  'categories.manage.delete': 'Supprimer la catégorie',
++  'categories.manage.empty': 'Aucune catégorie.',
+   'error.invalidName': 'Donnez un nom à cet élément.',
+   'error.invalidDate': 'La date est invalide.',
+   'error.invalidMonth': 'Le mois est invalide.',
+@@ -740,9 +926,9 @@ export const en: Record<TranslationKey, string> = {
+   'budgets.expenseAdd': 'Add the expense',
+   'budgets.recent': 'Latest expenses',
+   'budgets.noExpense': 'No expense yet.',
+-  'budgets.more': 'And {count} more in your planned purchases.',
++  'budgets.more': 'And {count} more in your purchases.',
+   'budgets.deleteTitle': 'Delete “{name}”?',
+-  'budgets.deleteKeep': 'Its sub-envelopes are deleted too. Its expenses stay in your planned purchases, without a budget.',
++  'budgets.deleteKeep': 'Its sub-envelopes are deleted too. Its expenses stay in your purchases, without a budget.',
+   'budgets.deleteForecast': 'Its sub-envelopes and its forecast expenses are deleted too.',
+   'budgets.empty.title': 'No budget yet',
+   'budgets.empty.body': 'Create a budget (groceries, leisure…), then add your expenses to it: it updates itself.',
+@@ -811,7 +997,7 @@ export const en: Record<TranslationKey, string> = {
+   'settings.historicThemes': 'Historic themes',
+   'empty.fixed.title': 'No subscriptions yet',
+   'empty.fixed.body': 'Add your first subscription or direct debit with the form.',
+-  'empty.variable.title': 'No purchases planned this month',
++  'empty.variable.title': 'No purchases this month',
+   'empty.variable.body': 'Add a purchase with the form, or from a day of the calendar.',
+   'empty.loans.title': 'No loans yet',
+   'empty.loans.body': 'Add a loan to count its payments in what you have left.',
+@@ -820,18 +1006,18 @@ export const en: Record<TranslationKey, string> = {
+   'nav.overview': 'Overview',
+   'nav.calendar': 'Calendar',
+   'nav.fixed': 'Subscriptions',
+-  'nav.variable': 'Planned purchases',
++  'nav.variable': 'Purchases',
+   'nav.loans': 'Loans',
+   'nav.settings': 'Settings',
+   'nav.profile': 'Profile',
+   'view.overview.eyebrow': 'Your budget',
+   'view.overview.title': 'My monthly budget',
+-  'view.calendar.eyebrow': 'Due dates and planned purchases',
++  'view.calendar.eyebrow': 'Due dates and purchases',
+   'view.calendar.title': 'Calendar',
+   'view.fixed.eyebrow': 'Recurring charges',
+   'view.fixed.title': 'My subscriptions and direct debits',
+-  'view.variable.eyebrow': 'Planned purchases',
+-  'view.variable.title': 'My planned purchases',
++  'view.variable.eyebrow': 'Purchases',
++  'view.variable.title': 'My purchases',
+   'view.loans.eyebrow': 'Ongoing loans',
+   'view.loans.title': 'My bank loans',
+   'view.settings.eyebrow': 'Appearance, sounds and data',
+@@ -843,7 +1029,7 @@ export const en: Record<TranslationKey, string> = {
+   'month.label': 'Month',
+   'card.income': 'Monthly income',
+   'card.fixed': 'Subscriptions / Direct debits',
+-  'card.variable': 'Planned purchases',
++  'card.variable': 'Purchases',
+   'card.loans': 'Loans',
+   'card.remaining': 'Left to live on',
+   'insight.status': 'Budget status',
+@@ -869,11 +1055,11 @@ export const en: Record<TranslationKey, string> = {
+   'form.fixed.type.subscription': 'Subscription',
+   'form.fixed.type.directDebit': 'Direct debit',
+   'form.fixed.submit': 'Add',
+-  'form.variable.title': 'Plan a purchase',
++  'form.variable.title': 'Add a purchase',
+   'form.variable.name': 'Purchase name',
+-  'form.variable.amount': 'Planned price',
++  'form.variable.amount': 'Price',
+   'form.variable.category': 'Category',
+-  'form.variable.date': 'Planned date',
++  'form.variable.date': 'Date',
+   'form.variable.submit': 'Add purchase',
+   'form.loan.title': 'New loan',
+   'form.loan.name': 'Loan name',
+@@ -885,8 +1071,8 @@ export const en: Record<TranslationKey, string> = {
+   'list.fixed.title': 'My subscriptions and direct debits',
+   'list.fixed.subtitle': 'What comes out every month. Deactivate without deleting.',
+   'list.fixed.day': 'on day {day}',
+-  'list.variable.title': 'My planned purchases',
+-  'list.variable.subtitle': 'Purchases planned for {month}.',
++  'list.variable.title': 'My purchases',
++  'list.variable.subtitle': 'Purchases of {month}.',
+   'list.loans.title': 'My loans',
+   'list.loans.subtitle': 'Your ongoing loans and their monthly payments.',
+   'list.activate': 'Activate',
+@@ -969,7 +1155,7 @@ export const en: Record<TranslationKey, string> = {
+   'advanced.contributedOf': 'Including {amount} contributed',
+   'advanced.interestOf': 'Including {amount} in interest',
+   'calendar.monthlyView': 'Monthly view',
+-  'calendar.hint': 'Your subscriptions, direct debits and planned purchases, day by day.',
++  'calendar.hint': 'Your subscriptions, direct debits and purchases, day by day.',
+   'calendar.prevMonth': 'Previous month',
+   'calendar.nextMonth': 'Next month',
+   'calendar.newSubscription': 'New subscription / direct debit',
+@@ -1110,6 +1296,99 @@ export const en: Record<TranslationKey, string> = {
+   'nebula.notInstalled': 'Nebula Hub is not installed: its download page just opened.',
+   'dock.bar': 'Shown inside Nebula Hub',
+   'dock.detach': 'Detach',
++  'nav.incomes': 'Income',
++  'nav.ledger': 'Money in and out',
++  'nav.categories': 'Categories',
++  'view.incomes.eyebrow': 'Money coming in',
++  'view.incomes.title': 'My income',
++  'view.ledger.eyebrow': 'Day after day',
++  'view.ledger.title': 'Money in and out',
++  'view.categories.eyebrow': 'By category and by month',
++  'view.categories.title': 'Categories',
++  'incomes.card.base': 'Main income',
++  'incomes.card.recurring': 'Recurring income',
++  'incomes.card.oneOff': 'One-off income',
++  'incomes.card.total': 'Month total',
++  'incomes.base.title': 'Main monthly income',
++  'incomes.base.hint': 'What you receive every month (salary, pension). Other income is added below.',
++  'incomes.form.title': 'Add income',
++  'incomes.form.name': 'Income name',
++  'incomes.form.amount': 'Amount',
++  'incomes.form.category': 'Category',
++  'incomes.form.categoryNone': 'No category',
++  'incomes.form.type': 'Income type',
++  'incomes.type.once': 'One-off',
++  'incomes.type.monthly': 'Recurring',
++  'incomes.form.date': 'Date',
++  'incomes.form.day': 'Day of the month (optional)',
++  'incomes.form.submit': 'Add income',
++  'incomes.note.once': 'Received once, on the chosen date: a bonus, a refund, a sale.',
++  'incomes.note.monthly': 'Received every month: a second salary, a benefit, rent received.',
++  'incomes.list.recurring.title': 'Recurring income',
++  'incomes.list.recurring.subtitle': 'Counted every month while active.',
++  'incomes.list.once.title': 'One-off income',
++  'incomes.list.once.subtitle': 'Received in {month}.',
++  'incomes.empty.recurring.title': 'No recurring income',
++  'incomes.empty.recurring.body': 'Add here what comes in every month besides your main income.',
++  'incomes.empty.once.title': 'No one-off income this month',
++  'incomes.empty.once.body': 'A bonus, a refund or a sale: add them with their date.',
++  'incomes.detail.day': 'On day {day} of the month',
++  'incomes.detail.everyMonth': 'Every month',
++  'error.saveIncomeEntry': 'Unable to save the income.',
++  'error.saveCategories': 'Unable to save the categories.',
++  'error.invalidCategory': 'This category is not valid.',
++  'error.duplicateCategory': 'This category already exists.',
++  'category.income.salary': 'Salary',
++  'category.income.bonus': 'Bonus',
++  'category.income.benefits': 'Benefits and allowances',
++  'category.income.refund': 'Refund',
++  'category.income.sale': 'Sale',
++  'category.food': 'Groceries',
++  'category.leisure': 'Leisure',
++  'category.health': 'Health',
++  'ledger.hint': 'Everything coming in and going out this month, in date order.',
++  'ledger.filter.label': 'Show',
++  'ledger.filter.all': 'All',
++  'ledger.filter.in': 'Money in',
++  'ledger.filter.out': 'Money out',
++  'ledger.totalIn': 'Money in',
++  'ledger.totalOut': 'Money out',
++  'ledger.balance': 'Month balance',
++  'ledger.undated': 'During the month, no set day',
++  'ledger.baseIncome': 'Main monthly income',
++  'ledger.type.baseIncome': 'Main income',
++  'ledger.type.incomeOnce': 'One-off income',
++  'ledger.type.incomeMonthly': 'Recurring income',
++  'ledger.type.purchase': 'Purchase',
++  'ledger.type.loan': 'Loan payment',
++  'ledger.runningBalance': 'Balance: {amount}',
++  'ledger.empty.title': 'No movement this month',
++  'ledger.empty.body': 'Add an income, a charge or a purchase: they will show here, day after day.',
++  'ledger.empty.filtered': 'Nothing to show with this filter.',
++  'categories.hint': 'This month’s money in and out, grouped by category.',
++  'categories.in.title': 'Money in by category',
++  'categories.out.title': 'Money out by category',
++  'categories.count.one': '1 entry',
++  'categories.count.many': '{count} entries',
++  'categories.empty.in': 'No money in this month.',
++  'categories.empty.out': 'No money out this month.',
++  'categories.uncategorized': 'No category',
++  'categories.baseIncome': 'Main income',
++  'categories.loans': 'Loans',
++  'categories.history.title': 'Month by month',
++  'categories.history.subtitle': 'The last twelve months. Click a month to see its categories.',
++  'categories.history.month': 'Month',
++  'categories.manage.title': 'Manage categories',
++  'categories.manage.hint': 'Create your own categories or delete the ones you do not use. Items already saved keep their category.',
++  'categories.manage.expense': 'Expense categories',
++  'categories.manage.income': 'Income categories',
++  'categories.manage.name': 'New category',
++  'categories.manage.kind': 'For',
++  'categories.manage.kind.expense': 'Expenses',
++  'categories.manage.kind.income': 'Income',
++  'categories.manage.add': 'Create category',
++  'categories.manage.delete': 'Delete category',
++  'categories.manage.empty': 'No category.',
+   'error.invalidName': 'Give this item a name.',
+   'error.invalidDate': 'The date is invalid.',
+   'error.invalidMonth': 'The month is invalid.',
+@@ -1135,6 +1414,7 @@ const ERROR_CODE_TO_KEY: Record<string, TranslationKey> = {
+   ERR_BACKUP_KEY_UNKNOWN: 'error.backupKeyUnknown',
+   ERR_GUEST_READONLY: 'error.guestReadonly',
+   ERR_INVALID_NAME: 'error.invalidName',
++  ERR_INVALID_CATEGORY: 'error.invalidCategory',
+   ERR_INVALID_DATE: 'error.invalidDate',
+   ERR_INVALID_MONTH: 'error.invalidMonth',
+   ERR_TOO_MANY_ATTEMPTS: 'error.tooManyAttempts',
+diff --git a/src/renderer/styles.css b/src/renderer/styles.css
+index 920bdf5fdfb11215c3009162a33da60736660bfe..6880946b69a501d206117b1d7c5d2b07de40148c 100644
+--- a/src/renderer/styles.css
++++ b/src/renderer/styles.css
+@@ -899,3 +899,71 @@ button.ghost.pressed { border-color: var(--accent); background: var(--accent-sof
+ .save-key-code code { word-break: break-all; letter-spacing: 0.04em; font-size: 0.78rem; }
+ .save-key-input { flex: 1 1 280px; min-width: 0; font-family: ui-monospace, "Cascadia Mono", Consolas, monospace; }
+ .save-key-warning { display: flex; align-items: center; gap: 0.35rem; color: var(--warning); }
++
++/* Incomes, money in and out, categories. Only existing tokens; nothing but opacity/transform moves. */
++.field-note { margin: 0; color: var(--muted); font-size: 0.74rem; line-height: 1.5; }
++.income-forms { grid-template-columns: minmax(0, 1fr) minmax(0, 2fr); align-items: start; }
++.income-form .segmented { justify-self: start; }
++.income-form .field-grid { grid-template-columns: repeat(2, minmax(0, 1fr)); }
++.income-form .field-grid > :is(.segmented, .field-note, .form-error, button[type='submit']) { grid-column: 1 / -1; }
++.income-form button[type='submit'] { justify-self: start; }
++
++.ledger-panel, .history-card, .category-manage { margin-top: 1rem; }
++.view-ledger .ledger-panel { margin-top: 0; }
++.ledger-toolbar { display: flex; flex-wrap: wrap; align-items: center; justify-content: space-between; gap: 0.8rem; margin-bottom: 1rem; }
++.ledger-hint { margin: 0; color: var(--muted); font-size: 0.74rem; line-height: 1.5; }
++.ledger-day { margin-top: 1.2rem; }
++.ledger-day h3 { margin: 0; color: var(--muted); font-size: 0.7rem; font-weight: 750; letter-spacing: 0.08em; text-transform: uppercase; }
++.list-card .ledger-day ul { margin-top: 0.6rem; }
++.ledger-icon.in { background: var(--positive-soft); color: var(--positive); }
++.ledger-icon.out { background: var(--danger-soft); color: var(--danger); }
++.ledger-amounts { flex: 0 0 auto; flex-direction: column; align-items: end; gap: 0.15rem; }
++.ledger-balance { color: var(--muted); font-size: 0.68rem; font-variant-numeric: tabular-nums; }
++
++.category-card .list-heading { display: flex; align-items: start; justify-content: space-between; gap: 1rem; }
++.category-card .list-heading > strong { font-size: 1.05rem; font-weight: 750; white-space: nowrap; }
++.category-rows .list-text span { white-space: normal; }
++.category-bar { margin-top: 0.5rem; height: 0.35rem; }
++.category-bar.in i { background: var(--positive); }
++.category-bar.out i { background: var(--danger); }
++
++.history-table { display: grid; gap: 0.35rem; margin-top: 1rem; }
++.history-row { display: grid; grid-template-columns: minmax(8rem, 1.4fr) repeat(3, minmax(0, 1fr)); align-items: center; gap: 0.8rem; width: 100%; min-height: 2.6rem; padding: 0.55rem 0.85rem; border: 1px solid var(--line); border-radius: 8px; background: var(--surface-muted); color: var(--ink); font-size: 0.78rem; font-weight: 600; text-align: left; box-shadow: none; }
++.history-row > :not(:first-child) { text-align: right; font-variant-numeric: tabular-nums; }
++button.history-row:hover { border-color: var(--accent); background: var(--surface-muted); box-shadow: none; }
++.history-row.active { border-color: var(--accent); background: var(--accent-soft); }
++.history-head { min-height: 0; padding-block: 0.2rem; border-color: transparent; background: transparent; color: var(--muted); font-size: 0.68rem; font-weight: 750; letter-spacing: 0.06em; text-transform: uppercase; }
++
++.category-form { display: grid; grid-template-columns: minmax(0, 2fr) minmax(0, 1fr) auto; align-items: end; gap: 0.9rem; margin-top: 1rem; }
++.category-form label { display: grid; gap: 0.35rem; color: var(--muted); font-size: 0.72rem; font-weight: 650; }
++.category-form + .form-error { margin-top: 0.6rem; }
++.category-manage-grid { display: grid; grid-template-columns: repeat(2, minmax(0, 1fr)); gap: 1.4rem; margin-top: 1.3rem; }
++.category-manage-list h3 { margin: 0; font-size: 0.82rem; }
++.list-card .category-chips { display: flex; flex-wrap: wrap; gap: 0.5rem; margin-top: 0.7rem; }
++.list-card .category-chips li { justify-content: start; gap: 0.45rem; padding: 0.3rem 0.35rem 0.3rem 0.7rem; border-radius: 999px; font-size: 0.76rem; animation: none; }
++.list-card .category-chips li:hover { transform: none; }
++.category-chips .icon { color: var(--accent-hover); }
++.category-chips button { min-height: 1.8rem; width: 1.8rem; padding: 0; }
++
++@media (max-width: 1100px) { .income-forms { grid-template-columns: 1fr; } }
++@media (max-width: 720px) {
++  .income-form .field-grid, .category-form, .category-manage-grid { grid-template-columns: 1fr; }
++  .ledger-amounts { align-items: start; }
++  .history-row { grid-template-columns: 1fr 1fr; }
++  .history-head { display: none; }
++  .list-card .category-chips li { flex-direction: row; align-items: center; }
++}
++
++/* Sidebar with more sections than a short window can show: the groups scroll, the rest stays put.
++   The icon rail (<= 1100 px) and the top bar (<= 720 px) keep their own layout. */
++.sidebar .sidebar-nav-scroll { display: contents; }
++@media (min-width: 1101px) {
++  .sidebar .sidebar-nav { flex: 1 1 0; min-height: 0; }
++  .sidebar .sidebar-nav-scroll { display: flex; flex: 1 1 0; flex-direction: column; gap: inherit; min-height: 0; margin-right: -0.45rem; padding-right: 0.45rem; overflow-y: auto; scrollbar-width: thin; scrollbar-color: var(--line) transparent; }
++}
++/* A soft fade at the bottom of the sections while more of them are below (driven by the scroll
++   position: an opacity keyframe only, and nothing shows when everything fits). */
++@media (min-width: 1101px) {
++  .sidebar .sidebar-nav-scroll::after { content: ''; position: sticky; bottom: 0; flex: 0 0 0; height: 0; box-shadow: 0 0 1.1rem 1.25rem color-mix(in srgb, var(--sidebar) 96%, transparent); pointer-events: none; opacity: 0; animation: nav-more-below linear both; animation-timeline: scroll(nearest); }
++}
++@keyframes nav-more-below { from { opacity: 1; } 85% { opacity: 1; } to { opacity: 0; } }
+diff --git a/src/shared/budget.test.ts b/src/shared/budget.test.ts
+index bacb3d07c5100bf90e139aa1540de08e851f0a05..10acf44243e68fc94baa2ef90094af5023e0b29b 100644
+--- a/src/shared/budget.test.ts
++++ b/src/shared/budget.test.ts
+@@ -5,11 +5,14 @@ import {
+   formatLocalDate,
+   getCalendarEntries,
+   getMonthKey,
++  incomeInputError,
+   isValidDateString,
+   isValidMonthKey,
+   normalizeSnapshot,
+   parseAmount,
++  sanitizeCategories,
+   sanitizeFixedExpense,
++  sanitizeIncome,
+   validateBackupFile,
+ } from './budget';
+ import type { BackupFile, BudgetSnapshot, FixedExpense } from './types';
+@@ -208,3 +211,62 @@ describe('backward-compatible backups', () => {
+     expect(snapshot.loans).toEqual([]);
+   });
+ });
++
++describe('incomes and categories', () => {
++  it('keeps a date only on a one-off income and a day only on a recurring one', () => {
++    expect(sanitizeIncome({ id: 'a', name: ' Prime ', amount: 100, category: 'Prime', frequency: 'once', date: '2026-05-04', dayOfMonth: 12 }))
++      .toEqual({ id: 'a', name: 'Prime', amount: 100, category: 'Prime', frequency: 'once', dayOfMonth: null, date: '2026-05-04', active: true });
++    expect(sanitizeIncome({ id: 'b', name: 'Aide', amount: 50, frequency: 'monthly', date: '2026-05-04', dayOfMonth: 45 }))
++      .toMatchObject({ frequency: 'monthly', dayOfMonth: 31, date: null, category: '' });
++    expect(sanitizeIncome({ id: 'c', name: 'x', amount: 1, frequency: 'weekly' as never }).frequency).toBe('once');
++  });
++
++  it('refuses an income without a name, with a bad amount, or one-off without a date', () => {
++    const base = sanitizeIncome({ id: 'a', name: 'Prime', amount: 100, frequency: 'once', date: '2026-05-04' });
++    expect(incomeInputError(base)).toBeNull();
++    expect(incomeInputError({ ...base, name: '' })).toBe('ERR_INVALID_NAME');
++    expect(incomeInputError({ ...base, amount: -1 })).toBe('ERR_NEGATIVE_AMOUNT');
++    expect(incomeInputError({ ...base, amount: Number.NaN })).toBe('ERR_NEGATIVE_AMOUNT');
++    expect(incomeInputError(sanitizeIncome({ id: 'a', name: 'Prime', amount: 100, frequency: 'once', date: '2026-02-31' }))).toBe('ERR_INVALID_DATE');
++    expect(incomeInputError(sanitizeIncome({ id: 'a', name: 'Aide', amount: 100, frequency: 'monthly' }))).toBeNull();
++  });
++
++  it('cleans a category list: trimmed names, one per name and kind, ids kept or created', () => {
++    let next = 0;
++    const list = sanitizeCategories(
++      [{ id: 'x', name: ' Courses ', kind: 'expense' }, { name: 'courses', kind: 'expense' }, { name: 'Courses', kind: 'income' }, { id: 'x', name: 'Loisirs', kind: 'expense' }],
++      () => `new-${(next += 1)}`,
++    );
++    expect(list).toEqual([
++      { id: 'x', name: 'Courses', kind: 'expense' },
++      { id: 'new-1', name: 'Courses', kind: 'income' },
++      { id: 'new-2', name: 'Loisirs', kind: 'expense' },
++    ]);
++    expect(sanitizeCategories([])).toEqual([]);
++    expect(sanitizeCategories('nope')).toBeNull();
++    expect(sanitizeCategories([{ name: '', kind: 'expense' }])).toBeNull();
++    expect(sanitizeCategories([{ name: 'A', kind: 'other' }])).toBeNull();
++    expect(sanitizeCategories([{ name: 'x'.repeat(41), kind: 'expense' }])).toBeNull();
++  });
++
++  it('reads a backup from before incomes and categories, and one that has them', () => {
++    const old = normalizeSnapshot({ settings: { income: 100, activeMonthKey: '2026-01' }, fixedExpenses: [], variableExpenses: [], loans: [] });
++    expect(old.incomes).toEqual([]);
++    expect('categories' in old).toBe(false);
++
++    const recent = normalizeSnapshot({
++      settings: { income: 100, activeMonthKey: '2026-01' },
++      fixedExpenses: [],
++      variableExpenses: [],
++      loans: [],
++      incomes: [
++        { id: 'i1', name: 'Prime', amount: 200, category: 'Prime', frequency: 'once', dayOfMonth: null, date: '2026-01-15', active: true },
++        { id: 'i2', name: '', amount: 5, category: '', frequency: 'monthly', dayOfMonth: null, date: null, active: true },
++        'garbage' as never,
++      ],
++      categories: [{ id: 'c1', name: 'Courses', kind: 'expense' }],
++    });
++    expect(recent.incomes?.map((income) => income.id)).toEqual(['i1']);
++    expect(recent.categories).toEqual([{ id: 'c1', name: 'Courses', kind: 'expense' }]);
++  });
++});
+diff --git a/src/shared/budget.ts b/src/shared/budget.ts
+index 103f44c88d7da24119898eb83c3c898dc4e3f1ea..2e85dd0d67f779d5d216bfbba4817063c507e26b 100644
+--- a/src/shared/budget.ts
++++ b/src/shared/budget.ts
+@@ -1,4 +1,4 @@
+-import type { BackupFile, Budget, BudgetSnapshot, BudgetSummary, CalendarEntry, FixedExpense, FixedExpenseKind, Loan, VariableExpense, Wallet, WalletMovement } from './types';
++import type { BackupFile, Budget, BudgetSnapshot, BudgetSummary, CalendarEntry, Category, CategoryKind, FixedExpense, FixedExpenseKind, Income, IncomeFrequency, Loan, VariableExpense, Wallet, WalletMovement } from './types';
+ import { countsInMonth, effectiveBudget, sanitizeBudget, sanitizeWallet, sanitizeWalletMovement } from './budgets';
+ 
+ export function getMonthKey(date: Date): string {
+@@ -59,9 +59,26 @@ export function createEmptySnapshot(): BudgetSnapshot {
+     budgets: [],
+     wallets: [],
+     walletMovements: [],
++    incomes: [],
+   };
+ }
+ 
++/**
++ * What comes in during `monthKey`: the main monthly income, the active recurring incomes, and the
++ * active one-off incomes dated in that month.
++ */
++export function incomeTotals(snapshot: BudgetSnapshot, monthKey: string): { base: number; recurring: number; oneOff: number; total: number } {
++  const base = Number(snapshot.settings.income) || 0;
++  let recurring = 0;
++  let oneOff = 0;
++  for (const income of snapshot.incomes ?? []) {
++    if (!income.active) continue;
++    if (income.frequency === 'monthly') recurring += income.amount;
++    else if (income.date && income.date.slice(0, 7) === monthKey) oneOff += income.amount;
++  }
++  return { base, recurring, oneOff, total: base + recurring + oneOff };
++}
++
+ export function computeBudgetSummary(snapshot: BudgetSnapshot, monthKey = snapshot.settings.activeMonthKey): BudgetSummary {
+   const totalFixedExpenses = snapshot.fixedExpenses
+     .filter((expense) => expense.active)
+@@ -79,13 +96,18 @@ export function computeBudgetSummary(snapshot: BudgetSnapshot, monthKey = snapsh
+ 
+   const totalExpenses = totalFixedExpenses + totalVariableExpenses + totalLoanPayments;
+ 
++  const incomes = incomeTotals(snapshot, monthKey);
++
+   return {
+-    income: snapshot.settings.income,
++    income: incomes.total,
++    baseIncome: incomes.base,
++    recurringIncome: incomes.recurring,
++    oneOffIncome: incomes.oneOff,
+     totalFixedExpenses,
+     totalVariableExpenses,
+     totalLoanPayments,
+     totalExpenses,
+-    remainingIncome: snapshot.settings.income - totalExpenses,
++    remainingIncome: incomes.total - totalExpenses,
+     activeMonthKey: monthKey,
+   };
+ }
+@@ -181,6 +203,65 @@ export function sanitizeVariableExpense(expense: VariableExpense): VariableExpen
+   };
+ }
+ 
++const INCOME_FREQUENCIES: IncomeFrequency[] = ['once', 'monthly'];
++
++/**
++ * A recurring income keeps an optional day and no date; a one-off income keeps its date and no
++ * day. Anything else that arrives (older data, a hand-edited backup) is brought back to that.
++ */
++export function sanitizeIncome(income: Partial<Income> & { id: string }): Income {
++  const frequency = INCOME_FREQUENCIES.includes(income.frequency as IncomeFrequency) ? (income.frequency as IncomeFrequency) : 'once';
++  const rawDay = income.dayOfMonth === null || income.dayOfMonth === undefined ? null : Math.trunc(Number(income.dayOfMonth)) || null;
++  return {
++    id: income.id,
++    name: asText(income.name).trim(),
++    amount: Number(income.amount) || 0,
++    category: asText(income.category).trim(),
++    frequency,
++    dayOfMonth: frequency === 'monthly' && rawDay !== null ? Math.min(31, Math.max(1, rawDay)) : null,
++    date: frequency === 'once' && isValidDateString(income.date) ? income.date : null,
++    active: income.active === undefined ? true : Boolean(income.active),
++  };
++}
++
++/** The error code for an income that cannot be saved, or null. */
++export function incomeInputError(income: Income): 'ERR_INVALID_NAME' | 'ERR_NEGATIVE_AMOUNT' | 'ERR_INVALID_DATE' | null {
++  if (!income.name) return 'ERR_INVALID_NAME';
++  if (!Number.isFinite(income.amount) || income.amount < 0) return 'ERR_NEGATIVE_AMOUNT';
++  if (income.frequency === 'once' && !income.date) return 'ERR_INVALID_DATE';
++  return null;
++}
++
++const CATEGORY_KINDS: CategoryKind[] = ['expense', 'income'];
++export const MAX_CATEGORIES = 60;
++export const MAX_CATEGORY_NAME = 40;
++
++/**
++ * The user's category list as it may be stored: named, of a known kind, one entry per name and
++ * kind (compared without case), in the order given. Null when an entry cannot be a category.
++ */
++export function sanitizeCategories(value: unknown, createId: () => string = defaultIdFactory): Category[] | null {
++  if (!Array.isArray(value) || value.length > MAX_CATEGORIES) return null;
++  const seen = new Set<string>();
++  const usedIds = new Set<string>();
++  const categories: Category[] = [];
++  for (const raw of value) {
++    const item = asRecord(raw);
++    if (!item) return null;
++    const name = asText(item.name).trim();
++    const kind = item.kind as CategoryKind;
++    if (!name || name.length > MAX_CATEGORY_NAME || !CATEGORY_KINDS.includes(kind)) return null;
++    const key = `${kind}:${name.toLocaleLowerCase()}`;
++    if (seen.has(key)) continue;
++    seen.add(key);
++    let id = asText(item.id).trim();
++    if (!id || usedIds.has(id)) id = createId();
++    usedIds.add(id);
++    categories.push({ id, name, kind });
++  }
++  return categories;
++}
++
+ export function sanitizeLoan(loan: Loan): Loan {
+   return {
+     ...loan,
+@@ -319,6 +400,14 @@ export function normalizeSnapshot(snapshot: BudgetSnapshot, createId: IdFactory
+     .map((item) => sanitizeWalletMovement({ ...(item as Partial<WalletMovement>), id: uniqueId(item.id) }))
+     .filter((movement) => walletIds.has(movement.walletId) && isValidDateString(movement.date) && movement.amount !== 0);
+ 
++  // Incomes and the user's categories (absent from older backups).
++  const incomes: Income[] = (Array.isArray(snapshot.incomes) ? snapshot.incomes : [])
++    .map(asRecord)
++    .filter((item): item is Record<string, unknown> => item !== null)
++    .map((item) => sanitizeIncome({ ...(item as Partial<Income>), id: uniqueId(item.id) }))
++    .filter((item) => incomeInputError(item) === null);
++  const categories = snapshot.categories === undefined ? null : sanitizeCategories(snapshot.categories, createId);
++
+   const income = Number(snapshot.settings?.income);
+   return {
+     settings: {
+@@ -331,6 +420,8 @@ export function normalizeSnapshot(snapshot: BudgetSnapshot, createId: IdFactory
+     budgets,
+     wallets,
+     walletMovements,
++    incomes,
++    ...(categories ? { categories } : {}),
+   };
+ }
+ 
+diff --git a/src/shared/cashflow.test.ts b/src/shared/cashflow.test.ts
+new file mode 100644
+index 0000000000000000000000000000000000000000..e847e8f4045873d78f01d1e68794523b29bd8692
+--- /dev/null
++++ b/src/shared/cashflow.test.ts
+@@ -0,0 +1,115 @@
++import { computeBudgetSummary, createEmptySnapshot } from './budget';
++import { BASE_INCOME_CATEGORY, categoryBreakdown, getLedger, ledgerTotals, LOAN_CATEGORY, monthlyHistory, shiftMonthKey } from './cashflow';
++import type { BudgetSnapshot } from './types';
++
++function sample(): BudgetSnapshot {
++  const snapshot = createEmptySnapshot();
++  snapshot.settings = { income: 2000, activeMonthKey: '2026-02' };
++  snapshot.incomes = [
++    { id: 'i1', name: 'Loyer perçu', amount: 400, category: 'Loyers', frequency: 'monthly', dayOfMonth: 31, date: null, active: true },
++    { id: 'i2', name: 'Prime', amount: 300, category: 'Prime', frequency: 'once', dayOfMonth: null, date: '2026-02-10', active: true },
++    { id: 'i3', name: 'Vente vélo', amount: 150, category: 'Vente', frequency: 'once', dayOfMonth: null, date: '2026-03-02', active: true },
++    { id: 'i4', name: 'Ancienne aide', amount: 90, category: 'Aides', frequency: 'monthly', dayOfMonth: 5, date: null, active: false },
++  ];
++  snapshot.fixedExpenses = [
++    { id: 'f1', name: 'Loyer', amount: 700, category: 'Logement', dayOfMonth: 3, active: true, kind: 'directDebit' },
++    { id: 'f2', name: 'Assurance', amount: 40, category: 'Assurance', dayOfMonth: null, active: true, kind: 'directDebit' },
++    { id: 'f3', name: 'Salle', amount: 30, category: 'Sport', dayOfMonth: 10, active: false, kind: 'subscription' },
++  ];
++  snapshot.budgets = [
++    { id: 'b1', name: 'Voyage', scale: 'project', parentId: null, amount: 1000, period: 'open', startDate: null, endDate: null, countsInMonth: false },
++  ];
++  snapshot.variableExpenses = [
++    { id: 'v1', name: 'Courses', amount: 80, category: 'Courses', date: '2026-02-10', monthKey: '2026-02', budgetId: null },
++    { id: 'v2', name: 'Marché', amount: 20, category: 'courses ', date: '2026-02-14', monthKey: '2026-02', budgetId: null },
++    { id: 'v3', name: 'Billets', amount: 500, category: 'Voyage', date: '2026-02-12', monthKey: '2026-02', budgetId: 'b1' },
++    { id: 'v4', name: 'Cadeau', amount: 60, category: '', date: '2026-03-01', monthKey: '2026-03', budgetId: null },
++  ];
++  snapshot.loans = [
++    { id: 'l1', name: 'Auto', principal: 5000, monthlyPayment: 150, interestRate: 2, remainingMonths: 20, active: true },
++    { id: 'l2', name: 'Soldé', principal: 1000, monthlyPayment: 50, interestRate: 0, remainingMonths: 0, active: false },
++  ];
++  return snapshot;
++}
++
++describe('ledger', () => {
++  it('lists the month in date order: no day first, money in before money out on the same day', () => {
++    const ledger = getLedger(sample(), '2026-02');
++    expect(ledger.map((entry) => entry.key)).toEqual([
++      'base-income', 'fixed-f2', 'loan-l1', 'fixed-f1', 'income-i2', 'purchase-v1', 'purchase-v3', 'purchase-v2', 'income-i1',
++    ]);
++    expect(ledger.map((entry) => entry.day)).toEqual([null, null, null, 3, 10, 10, 12, 14, 28]);
++  });
++
++  it('builds a running balance that leaves forecast purchases out', () => {
++    const ledger = getLedger(sample(), '2026-02');
++    expect(ledger.map((entry) => entry.balance)).toEqual([2000, 1960, 1810, 1110, 1410, 1330, 1330, 1310, 1710]);
++    expect(ledger.find((entry) => entry.key === 'purchase-v3')).toMatchObject({ forecast: true, budgetName: 'Voyage' });
++    expect(ledgerTotals(ledger)).toEqual({ totalIn: 2700, totalOut: 990, balance: 1710 });
++  });
++
++  it('agrees with the budget summary of the same month', () => {
++    const snapshot = sample();
++    for (const monthKey of ['2026-02', '2026-03', '2025-11']) {
++      const summary = computeBudgetSummary(snapshot, monthKey);
++      const totals = ledgerTotals(getLedger(snapshot, monthKey));
++      expect(totals.totalIn).toBe(summary.income);
++      expect(totals.totalOut).toBe(summary.totalExpenses);
++      expect(totals.balance).toBe(summary.remainingIncome);
++    }
++  });
++
++  it('counts incomes in the summary: main, recurring, and one-off of the month', () => {
++    const summary = computeBudgetSummary(sample(), '2026-02');
++    expect(summary).toMatchObject({ income: 2700, baseIncome: 2000, recurringIncome: 400, oneOffIncome: 300 });
++    expect(computeBudgetSummary(sample(), '2026-03').oneOffIncome).toBe(150);
++  });
++
++  it('puts a recurring item of the 31st on the last day of a shorter month, and returns nothing for a bad month', () => {
++    expect(getLedger(sample(), '2026-02').find((entry) => entry.key === 'income-i1')?.day).toBe(28);
++    expect(getLedger(sample(), '2026-03').find((entry) => entry.key === 'income-i1')?.day).toBe(31);
++    expect(getLedger(sample(), 'nope')).toEqual([]);
++  });
++
++  it('has no main-income line when the main income is zero', () => {
++    const snapshot = sample();
++    snapshot.settings.income = 0;
++    expect(getLedger(snapshot, '2026-02').some((entry) => entry.source === 'baseIncome')).toBe(false);
++  });
++});
++
++describe('category breakdown', () => {
++  it('groups money in and out by category, largest first, without regard to case', () => {
++    const breakdown = categoryBreakdown(sample(), '2026-02');
++    expect(breakdown.out.map((item) => [item.category, item.amount, item.count])).toEqual([
++      ['Logement', 700, 1],
++      [LOAN_CATEGORY, 150, 1],
++      ['Courses', 100, 2],
++      ['Assurance', 40, 1],
++    ]);
++    expect(breakdown.in.map((item) => [item.category, item.amount])).toEqual([[BASE_INCOME_CATEGORY, 2000], ['Loyers', 400], ['Prime', 300]]);
++    expect(breakdown.totalOut).toBe(990);
++    expect(breakdown.out.reduce((sum, item) => sum + item.share, 0)).toBeCloseTo(1);
++  });
++
++  it('keeps items without a category together, and shares at zero when nothing moved', () => {
++    const march = categoryBreakdown(sample(), '2026-03');
++    expect(march.out.find((item) => item.category === '')).toMatchObject({ amount: 60, count: 1 });
++    const empty = categoryBreakdown(createEmptySnapshot(), '2026-03');
++    expect(empty).toMatchObject({ totalIn: 0, totalOut: 0, in: [], out: [] });
++  });
++});
++
++describe('monthly history', () => {
++  it('returns the months ending with the given one, oldest first', () => {
++    const history = monthlyHistory(sample(), '2026-03', 3);
++    expect(history.map((month) => month.monthKey)).toEqual(['2026-01', '2026-02', '2026-03']);
++    expect(history[1]).toMatchObject({ totalIn: 2700, totalOut: 990, balance: 1710 });
++    expect(history[2]).toMatchObject({ totalIn: 2550, totalOut: 950 });
++  });
++
++  it('shifts month keys across years', () => {
++    expect(shiftMonthKey('2026-01', -1)).toBe('2025-12');
++    expect(shiftMonthKey('2025-12', 2)).toBe('2026-02');
++  });
++});
+diff --git a/src/shared/cashflow.ts b/src/shared/cashflow.ts
+new file mode 100644
+index 0000000000000000000000000000000000000000..d207102d0adacbe34179acf52647cdb1576da88a
+--- /dev/null
++++ b/src/shared/cashflow.ts
+@@ -0,0 +1,179 @@
++import type { BudgetSnapshot } from './types';
++import { daysInMonth, isValidDateString, isValidMonthKey } from './budget';
++import { countsInMonth } from './budgets';
++
++/**
++ * Money in and money out, seen three ways: one after the other by date (`getLedger`), grouped by
++ * category (`categoryBreakdown`), and month after month (`monthlyHistory`). Pure functions over a
++ * snapshot, following the same rules as `computeBudgetSummary` so every screen agrees:
++ * recurring charges, loans and recurring incomes belong to every month; purchases and one-off
++ * incomes to the month of their date; a purchase charged to a forecast budget is shown but never
++ * counted.
++ */
++export type LedgerSource = 'baseIncome' | 'income' | 'fixed' | 'purchase' | 'loan';
++
++export interface LedgerEntry {
++  /** Unique in a ledger: the same id may exist in two tables. */
++  key: string;
++  id: string;
++  source: LedgerSource;
++  direction: 'in' | 'out';
++  name: string;
++  category: string;
++  /** Always positive; `direction` tells the sign. */
++  amount: number;
++  /** Day of the month, or null when the item has no known day (a loan, the main income). */
++  day: number | null;
++  /** Comes back every month. */
++  recurring: boolean;
++  /** Charged to a forecast budget: listed, left out of the totals and of the running balance. */
++  forecast?: boolean;
++  budgetName?: string;
++  /** Balance of the month after this entry (entries without a day first, then day by day). */
++  balance: number;
++}
++
++/** The category of loan payments and of the main income, which have none of their own. */
++export const LOAN_CATEGORY = '__loans__';
++export const BASE_INCOME_CATEGORY = '__base_income__';
++
++const clampDay = (day: number, lastDay: number) => Math.min(Math.max(1, day), lastDay);
++
++/**
++ * Every movement of `monthKey` in date order: first what has no day, then day by day, money in
++ * before money out on the same day. A recurring item set on the 29th-31st lands on the last day of
++ * a shorter month, like in the calendar.
++ */
++export function getLedger(snapshot: BudgetSnapshot, monthKey: string): LedgerEntry[] {
++  if (!isValidMonthKey(monthKey)) return [];
++  const lastDay = daysInMonth(monthKey);
++  const budgets = snapshot.budgets ?? [];
++  const entries: Array<Omit<LedgerEntry, 'balance'>> = [];
++
++  if (snapshot.settings.income > 0) {
++    entries.push({ key: 'base-income', id: 'base-income', source: 'baseIncome', direction: 'in', name: '', category: BASE_INCOME_CATEGORY, amount: snapshot.settings.income, day: null, recurring: true });
++  }
++  for (const income of snapshot.incomes ?? []) {
++    if (!income.active) continue;
++    if (income.frequency === 'monthly') {
++      entries.push({ key: `income-${income.id}`, id: income.id, source: 'income', direction: 'in', name: income.name, category: income.category, amount: income.amount, day: income.dayOfMonth === null ? null : clampDay(income.dayOfMonth, lastDay), recurring: true });
++    } else if (isValidDateString(income.date) && income.date.slice(0, 7) === monthKey) {
++      entries.push({ key: `income-${income.id}`, id: income.id, source: 'income', direction: 'in', name: income.name, category: income.category, amount: income.amount, day: Number(income.date.slice(8, 10)), recurring: false });
++    }
++  }
++  for (const expense of snapshot.fixedExpenses) {
++    if (!expense.active) continue;
++    entries.push({ key: `fixed-${expense.id}`, id: expense.id, source: 'fixed', direction: 'out', name: expense.name, category: expense.category, amount: expense.amount, day: expense.dayOfMonth === null ? null : clampDay(expense.dayOfMonth, lastDay), recurring: true });
++  }
++  for (const expense of snapshot.variableExpenses) {
++    if (expense.monthKey !== monthKey) continue;
++    const budget = expense.budgetId ? budgets.find((candidate) => candidate.id === expense.budgetId) : undefined;
++    entries.push({
++      key: `purchase-${expense.id}`,
++      id: expense.id,
++      source: 'purchase',
++      direction: 'out',
++      name: expense.name,
++      category: expense.category,
++      amount: expense.amount,
++      day: isValidDateString(expense.date) && expense.date.slice(0, 7) === monthKey ? Number(expense.date.slice(8, 10)) : null,
++      recurring: false,
++      ...(countsInMonth(expense, budgets) ? {} : { forecast: true }),
++      ...(budget ? { budgetName: budget.name } : {}),
++    });
++  }
++  for (const loan of snapshot.loans ?? []) {
++    if (!loan.active) continue;
++    entries.push({ key: `loan-${loan.id}`, id: loan.id, source: 'loan', direction: 'out', name: loan.name, category: LOAN_CATEGORY, amount: loan.monthlyPayment, day: null, recurring: true });
++  }
++
++  // Stable sort: no day first, then by day, incomes before expenses, then as listed.
++  const order = (entry: Omit<LedgerEntry, 'balance'>) => (entry.day ?? 0) * 2 + (entry.direction === 'in' ? 0 : 1);
++  const sorted = entries.map((entry, index) => ({ entry, index })).sort((a, b) => order(a.entry) - order(b.entry) || a.index - b.index);
++
++  let balance = 0;
++  return sorted.map(({ entry }) => {
++    if (!entry.forecast) balance += entry.direction === 'in' ? entry.amount : -entry.amount;
++    return { ...entry, balance };
++  });
++}
++
++export interface LedgerTotals {
++  totalIn: number;
++  totalOut: number;
++  balance: number;
++}
++
++/** Totals of a ledger, forecast purchases left out. */
++export function ledgerTotals(entries: readonly LedgerEntry[]): LedgerTotals {
++  let totalIn = 0;
++  let totalOut = 0;
++  for (const entry of entries) {
++    if (entry.forecast) continue;
++    if (entry.direction === 'in') totalIn += entry.amount;
++    else totalOut += entry.amount;
++  }
++  return { totalIn, totalOut, balance: totalIn - totalOut };
++}
++
++export interface CategoryTotal {
++  /** The category name as stored on the items; '' when none; or one of the two special keys above. */
++  category: string;
++  amount: number;
++  count: number;
++  /** Part of the direction's total, from 0 to 1. */
++  share: number;
++}
++
++export interface CategoryBreakdown extends LedgerTotals {
++  in: CategoryTotal[];
++  out: CategoryTotal[];
++}
++
++/**
++ * The month's money in and out grouped by category, largest first. Names are grouped without
++ * regard to case or surrounding spaces ("Courses" and "courses " are one category); the first
++ * spelling met is the one shown.
++ */
++export function categoryBreakdown(snapshot: BudgetSnapshot, monthKey: string): CategoryBreakdown {
++  const entries = getLedger(snapshot, monthKey).filter((entry) => !entry.forecast);
++  const totals = ledgerTotals(entries);
++  const group = (direction: 'in' | 'out', total: number): CategoryTotal[] => {
++    const groups = new Map<string, CategoryTotal>();
++    for (const entry of entries) {
++      if (entry.direction !== direction) continue;
++      const name = entry.category.trim();
++      const key = name.toLocaleLowerCase();
++      const current = groups.get(key) ?? { category: name, amount: 0, count: 0, share: 0 };
++      current.amount += entry.amount;
++      current.count += 1;
++      groups.set(key, current);
++    }
++    return [...groups.values()]
++      .map((item) => ({ ...item, share: total > 0 ? item.amount / total : 0 }))
++      .sort((a, b) => b.amount - a.amount || a.category.localeCompare(b.category));
++  };
++  return { ...totals, in: group('in', totals.totalIn), out: group('out', totals.totalOut) };
++}
++
++export interface MonthTotals extends LedgerTotals {
++  monthKey: string;
++}
++
++/** `monthKey` shifted by `offset` months. */
++export function shiftMonthKey(monthKey: string, offset: number): string {
++  const [year, month] = monthKey.split('-').map(Number);
++  const date = new Date(year, month - 1 + offset, 1);
++  return `${date.getFullYear()}-${String(date.getMonth() + 1).padStart(2, '0')}`;
++}
++
++/** The `count` months ending with `monthKey`, oldest first, with their totals. */
++export function monthlyHistory(snapshot: BudgetSnapshot, monthKey: string, count = 12): MonthTotals[] {
++  if (!isValidMonthKey(monthKey)) return [];
++  const months: MonthTotals[] = [];
++  for (let offset = -(count - 1); offset <= 0; offset += 1) {
++    const key = shiftMonthKey(monthKey, offset);
++    months.push({ monthKey: key, ...ledgerTotals(getLedger(snapshot, key)) });
++  }
++  return months;
++}
+diff --git a/src/shared/global.d.ts b/src/shared/global.d.ts
+index 3afacc5ca3d626a9274c1eec2ba81463399cd93f..4db640236985f2e172e7f023c9bac4a100bcff2f 100644
+--- a/src/shared/global.d.ts
++++ b/src/shared/global.d.ts
+@@ -1,4 +1,4 @@
+-import type { BackupFile, Budget, BudgetSnapshot, Loan, NebulaState, PendingBackup, SyncStatus, UpdateStatus, Wallet, WalletMovement } from './types';
++import type { BackupFile, Budget, BudgetSnapshot, Category, Income, Loan, NebulaState, PendingBackup, SyncStatus, UpdateStatus, Wallet, WalletMovement } from './types';
+ import type { LocalAccountSummary } from './accounts';
+ import type { NewsTab, NewsWidget } from './nebula';
+ import type { PackView } from './packs';
+@@ -33,6 +33,12 @@ declare global {
+       deleteWallet(id: string): Promise<BudgetSnapshot>;
+       addWalletMovement(movement: Partial<WalletMovement> & { walletId: string; amount: number; date: string }): Promise<BudgetSnapshot>;
+       deleteWalletMovement(id: string): Promise<BudgetSnapshot>;
++      /** Incomes besides the main monthly one: one-off (dated) or recurring (every month). */
++      addIncomeEntry(income: Partial<Income> & { name: string; amount: number }): Promise<BudgetSnapshot>;
++      toggleIncomeEntry(id: string, active: boolean): Promise<BudgetSnapshot>;
++      deleteIncomeEntry(id: string): Promise<BudgetSnapshot>;
++      /** Replaces the user's category list (create, delete). */
++      saveCategories(categories: Array<Pick<Category, 'name' | 'kind'> & { id?: string }>): Promise<BudgetSnapshot>;
+       exportBackup(): Promise<BackupFile>;
+       importBackup(backup: BackupFile): Promise<BudgetSnapshot>;
+       saveBackupToFile(): Promise<void>;
+diff --git a/src/shared/types.ts b/src/shared/types.ts
+index 1ce8e6e4d9e2ad268e7f7781e257eb43e328008a..08f34c734e862c203cf66820dfc75ea035079998 100644
+--- a/src/shared/types.ts
++++ b/src/shared/types.ts
+@@ -72,6 +72,35 @@ export interface WalletMovement {
+   date: string;
+ }
+ 
++/** Paid once on a date, or every month (optionally on a given day). */
++export type IncomeFrequency = 'once' | 'monthly';
++
++/**
++ * Money coming in besides the main monthly income of the settings: a bonus, a refund, a sale
++ * (`once`), or a second salary, an allowance, a rent received (`monthly`).
++ */
++export interface Income {
++  id: string;
++  name: string;
++  amount: number;
++  category: string;
++  frequency: IncomeFrequency;
++  /** `monthly` only: the day it arrives, when known. */
++  dayOfMonth: number | null;
++  /** `once` only: `YYYY-MM-DD`. */
++  date: string | null;
++  active: boolean;
++}
++
++export type CategoryKind = 'expense' | 'income';
++
++/** A category the user can pick in the forms. Items store the category's name, not its id. */
++export interface Category {
++  id: string;
++  name: string;
++  kind: CategoryKind;
++}
++
+ export interface BudgetSettings {
+   income: number;
+   activeMonthKey: string;
+@@ -86,10 +115,19 @@ export interface BudgetSnapshot {
+   budgets?: Budget[];
+   wallets?: Wallet[];
+   walletMovements?: WalletMovement[];
++  /** Incomes besides `settings.income`; absent from snapshots and backups written by older versions. */
++  incomes?: Income[];
++  /** The user's own category list; absent until it is edited (the built-in list applies). */
++  categories?: Category[];
+ }
+ 
+ export interface BudgetSummary {
++  /** Everything coming in this month: main income, recurring incomes, one-off incomes of the month. */
+   income: number;
++  /** The main monthly income of the settings. */
++  baseIncome: number;
++  recurringIncome: number;
++  oneOffIncome: number;
+   totalFixedExpenses: number;
+   totalVariableExpenses: number;
+   totalLoanPayments: number;
+@@ -178,4 +216,5 @@ export type ErrorCode =
+   | 'ERR_TOO_MANY_ATTEMPTS'
+   | 'ERR_SYNC_UNAVAILABLE'
+   | 'ERR_INVALID_BUDGET'
+-  | 'ERR_INVALID_WALLET';
++  | 'ERR_INVALID_WALLET'
++  | 'ERR_INVALID_CATEGORY';
+diff --git a/tests/electron/store.test.ts b/tests/electron/store.test.ts
+index 6332e57d9d00906ada7fc4ff9f50c60b5a4253fb..b63a5e653c7db5b10f39f60449baf7dd7f3fb7e2 100644
+--- a/tests/electron/store.test.ts
++++ b/tests/electron/store.test.ts
+@@ -191,4 +191,76 @@ describe('BudgetStore budgets and pots (v0.1.41)', () => {
+     expect(restored.wallets).toEqual([{ id: 'w', name: 'Coup dur', goal: null }]);
+     expect(restored.walletMovements).toEqual([expect.objectContaining({ id: 'm', amount: 50 })]);
+   });
++
++  it('opens an older database with no incomes and the built-in categories', async () => {
++    const databasePath = path.join(mockUserData, 'finterest-legacy.sqlite');
++    await writeLegacyDatabase(databasePath);
++    const snapshot = await new BudgetStore(databasePath).getSnapshot();
++    expect(snapshot.incomes).toEqual([]);
++    expect(snapshot.categories).toBeUndefined();
++    expect(snapshot.settings.income).toBe(1900);
++  });
++
++  it('adds one-off and recurring incomes, toggles and deletes them, and rejects invalid ones', async () => {
++    const store = new BudgetStore(path.join(mockUserData, 'incomes.sqlite'));
++    await store.addIncomeEntry({ id: 'once', name: ' Prime ', amount: 300, category: 'Prime', frequency: 'once', date: '2026-04-20' });
++    let snapshot = await store.addIncomeEntry({ id: 'monthly', name: 'Aide', amount: 120, category: 'Aides', frequency: 'monthly', dayOfMonth: 5 });
++    expect(snapshot.incomes).toEqual([
++      { id: 'once', name: 'Prime', amount: 300, category: 'Prime', frequency: 'once', dayOfMonth: null, date: '2026-04-20', active: true },
++      { id: 'monthly', name: 'Aide', amount: 120, category: 'Aides', frequency: 'monthly', dayOfMonth: 5, date: null, active: true },
++    ]);
++
++    await expect(store.addIncomeEntry({ name: '', amount: 10, frequency: 'monthly' })).rejects.toThrow('ERR_INVALID_NAME');
++    await expect(store.addIncomeEntry({ name: 'x', amount: -5, frequency: 'monthly' })).rejects.toThrow('ERR_NEGATIVE_AMOUNT');
++    await expect(store.addIncomeEntry({ name: 'x', amount: 'abc' as never, frequency: 'monthly' })).rejects.toThrow('ERR_NEGATIVE_AMOUNT');
++    await expect(store.addIncomeEntry({ name: 'x', amount: 5, frequency: 'once', date: '2026-02-30' })).rejects.toThrow('ERR_INVALID_DATE');
++
++    snapshot = await store.toggleIncomeEntry('monthly', false);
++    expect(snapshot.incomes?.find((income) => income.id === 'monthly')?.active).toBe(false);
++    snapshot = await store.deleteIncomeEntry('once');
++    expect(snapshot.incomes?.map((income) => income.id)).toEqual(['monthly']);
++
++    // Written to disk like everything else.
++    const reopened = await new BudgetStore(path.join(mockUserData, 'incomes.sqlite')).getSnapshot();
++    expect(reopened.incomes).toEqual(snapshot.incomes);
++  });
++
++  it('saves the category list whole, in order, and refuses an invalid one', async () => {
++    const databasePath = path.join(mockUserData, 'categories.sqlite');
++    const store = new BudgetStore(databasePath);
++    expect((await store.getSnapshot()).categories).toBeUndefined();
++
++    let snapshot = await store.saveCategories([{ name: 'Courses', kind: 'expense' }, { name: 'Salaire', kind: 'income' }, { name: 'Animaux', kind: 'expense' }]);
++    expect(snapshot.categories?.map(({ name, kind }) => [name, kind])).toEqual([['Courses', 'expense'], ['Salaire', 'income'], ['Animaux', 'expense']]);
++
++    // Deleting one keeps the others (and their ids); items already saved keep their category name.
++    await store.addVariableExpense({ name: 'Croquettes', amount: 20, category: 'Animaux', date: '2026-04-02' });
++    const kept = snapshot.categories!.filter((category) => category.name !== 'Animaux');
++    snapshot = await store.saveCategories(kept);
++    expect(snapshot.categories).toEqual(kept);
++    expect(snapshot.variableExpenses.find((expense) => expense.name === 'Croquettes')?.category).toBe('Animaux');
++
++    // An emptied list stays the user's own (empty) list, not the built-in one.
++    snapshot = await store.saveCategories([]);
++    expect(snapshot.categories).toEqual([]);
++    await expect(store.saveCategories([{ name: '', kind: 'expense' }])).rejects.toThrow('ERR_INVALID_CATEGORY');
++    expect((await new BudgetStore(databasePath).getSnapshot()).categories).toEqual([]);
++  });
++
++  it('carries incomes and categories through a backup, and goes back to the built-in categories with an older one', async () => {
++    const source = new BudgetStore(path.join(mockUserData, 'source.sqlite'));
++    await source.addIncomeEntry({ id: 'i1', name: 'Prime', amount: 300, category: 'Prime', frequency: 'once', date: '2026-04-20' });
++    await source.saveCategories([{ id: 'c1', name: 'Courses', kind: 'expense' }]);
++    const backup = await source.exportBackup();
++
++    const target = new BudgetStore(path.join(mockUserData, 'target.sqlite'));
++    const restored = await target.importBackup(JSON.parse(JSON.stringify(backup)));
++    expect(restored.incomes).toEqual([{ id: 'i1', name: 'Prime', amount: 300, category: 'Prime', frequency: 'once', dayOfMonth: null, date: '2026-04-20', active: true }]);
++    expect(restored.categories).toEqual([{ id: 'c1', name: 'Courses', kind: 'expense' }]);
++
++    const old = { app: 'Finterest', version: 1, exportedAt: '2026-01-01T00:00:00.000Z', snapshot: { settings: { income: 10, activeMonthKey: '2026-01' }, fixedExpenses: [], variableExpenses: [] } };
++    const afterOld = await target.importBackup(old);
++    expect(afterOld.incomes).toEqual([]);
++    expect(afterOld.categories).toBeUndefined();
++  });
+ });

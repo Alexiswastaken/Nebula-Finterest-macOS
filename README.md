@@ -3,8 +3,19 @@
 Builds macOS de [Nebula-Finterest](https://github.com/Memel-SQT/Nebula-Finterest), téléchargeables dans les [Releases](../../releases).
 
 - Le code de l'app vient tel quel du dépôt d'origine, à chaque nouveau commit sur `main`.
-- Seuls les patchs de [`patches/`](patches) sont ajoutés. Ils ne concernent **que macOS** (chaque modification est gardée par `process.platform === 'darwin'`, une option propre à la plateforme Mac, ou une branche équivalente) : les builds Windows et Linux du dépôt d'origine ne changent pas.
+- Seuls les patchs de [`patches/`](patches) sont ajoutés. Ils ne s'appliquent **qu'à ce build macOS** : les builds Windows et Linux du dépôt d'origine ne changent pas.
 - Les bugs macOS sont décrits dans [`bug-reports/macos/`](https://github.com/Memel-SQT/Nebula-Finterest/tree/main/bug-reports/macos) du dépôt d'origine.
+
+## Ajouts propres à ce build Mac
+
+Le patch `0002-incomes-ledger-categories.patch` ajoute des fonctions qui ne sont pas dans le Nebula Finterest d'origine :
+
+- **Revenus** : en plus du revenu mensuel principal, autant de revenus que voulu, ponctuels (une date) ou récurrents (tous les mois).
+- **Entrées et sorties** : tous les mouvements du mois à la suite, dans l'ordre des dates, avec le solde qui se construit.
+- **Catégories** : entrées et sorties du mois par catégorie, les douze derniers mois, et des catégories que l'on peut créer et supprimer.
+- « Achats prévus » s'appelle « Achats ».
+
+Les données restent compatibles avec la version d'origine (tables ajoutées, rien de modifié).
 
 ## Installation (app non signée)
 
